@@ -38,7 +38,7 @@
 ### 1. 克隆仓库并安装依赖
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/UNLINEARITY/CLI-WeChat-Bridge
 cd claude-code-wechat-channel
 bun install
 ```
