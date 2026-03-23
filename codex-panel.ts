@@ -30,7 +30,7 @@ function parseCliArgs(argv: string[]): CodexPanelCliOptions {
     if (arg === "--help" || arg === "-h") {
       process.stdout.write(
         [
-          "Usage: codex-panel [--cwd <path>]",
+          "Usage: wechat-codex [--cwd <path>]",
           "",
           'Starts the visible Codex panel and connects it to the running "wechat-bridge-codex" instance for the current directory.',
           "",

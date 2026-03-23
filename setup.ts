@@ -193,7 +193,7 @@ async function main() {
         console.log("After installing the package globally (for example: npm install -g . or npm link),");
         console.log("start the WeChat bridge from any directory with:");
         console.log("  wechat-bridge-codex");
-        console.log("  wechat-codex-panel   # start this in a second terminal in the same directory");
+        console.log("  wechat-codex         # start this in a second terminal in the same directory");
         console.log("  wechat-bridge-claude");
         console.log("  wechat-bridge-shell");
         console.log();

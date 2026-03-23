@@ -7,7 +7,7 @@
   "bin": {
     "wechat-bridge": "./bin/wechat-bridge.mjs",
     "wechat-bridge-codex": "./bin/wechat-bridge-codex.mjs",
-    "wechat-codex-panel": "./bin/wechat-codex-panel.mjs",
+    "wechat-codex": "./bin/wechat-codex.mjs",
     "wechat-bridge-claude": "./bin/wechat-bridge-claude.mjs",
     "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs"
   },

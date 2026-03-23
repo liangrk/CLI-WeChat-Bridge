@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  buildCodexCliArgs,
   buildCodexApprovalRequest,
   extractCodexFinalTextFromItem,
   extractCodexUserMessageText,
@@ -319,6 +320,56 @@ describe("buildCodexApprovalRequest", () => {
         "Codex needs approval before applying a file change: Extra write access is required for generated assets.",
       commandPreview: "C:\\repo\\generated",
     });
+  });
+});
+
+describe("buildCodexCliArgs", () => {
+  test("builds the standard remote tui args", () => {
+    expect(
+      buildCodexCliArgs("ws://127.0.0.1:8123", {
+        profile: "wechat",
+        inlineMode: false,
+      }),
+    ).toEqual([
+      "--enable",
+      "tui_app_server",
+      "--remote",
+      "ws://127.0.0.1:8123",
+      "--profile",
+      "wechat",
+    ]);
+  });
+
+  test("builds a real codex resume command for panel thread switching", () => {
+    expect(
+      buildCodexCliArgs("ws://127.0.0.1:8123", {
+        resumeThreadId: "thread_123",
+        profile: "wechat",
+      }),
+    ).toEqual([
+      "resume",
+      "thread_123",
+      "--enable",
+      "tui_app_server",
+      "--remote",
+      "ws://127.0.0.1:8123",
+      "--profile",
+      "wechat",
+    ]);
+  });
+
+  test("keeps inline mode for embedded codex rendering", () => {
+    expect(
+      buildCodexCliArgs("ws://127.0.0.1:8123", {
+        inlineMode: true,
+      }),
+    ).toEqual([
+      "--enable",
+      "tui_app_server",
+      "--remote",
+      "ws://127.0.0.1:8123",
+      "--no-alt-screen",
+    ]);
   });
 });
 

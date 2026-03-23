@@ -200,6 +200,33 @@ function coerceWebSocketMessageData(data: unknown): string | null {
   return null;
 }
 
+export function buildCodexCliArgs(
+  remoteUrl: string,
+  options: {
+    profile?: string;
+    inlineMode?: boolean;
+    resumeThreadId?: string;
+  } = {},
+): string[] {
+  const args: string[] = [];
+
+  if (options.resumeThreadId) {
+    args.push("resume", options.resumeThreadId);
+  }
+
+  args.push("--enable", "tui_app_server", "--remote", remoteUrl);
+
+  if (options.inlineMode) {
+    args.push("--no-alt-screen");
+  }
+
+  if (options.profile) {
+    args.push("--profile", options.profile);
+  }
+
+  return args;
+}
+
 export function buildCodexApprovalRequest(
   method: string,
   params: unknown,
@@ -1037,7 +1064,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     this.shuttingDown = false;
     this.setStatus(
       "starting",
-      'Waiting for manual Codex panel connection. Run "wechat-codex-panel" in a second terminal for this directory.',
+      'Waiting for manual Codex panel connection. Run "wechat-codex" in a second terminal for this directory.',
     );
 
     await new Promise<void>((resolve, reject) => {
@@ -1189,7 +1216,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
         if (!this.shuttingDown) {
           this.setStatus(
             "starting",
-            'Codex panel disconnected. Run "wechat-codex-panel" again in a second terminal for this directory.',
+            'Codex panel disconnected. Run "wechat-codex" again in a second terminal for this directory.',
           );
         }
       }
@@ -1274,7 +1301,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     const socket = this.socket;
     if (!socket) {
       throw new Error(
-        'Codex panel is not connected. Run "wechat-codex-panel" in a second terminal for this directory.',
+        'Codex panel is not connected. Run "wechat-codex" in a second terminal for this directory.',
       );
     }
     if (!this.state.pid && payload.command !== "dispose") {
@@ -1653,7 +1680,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   constructor(options: AdapterOptions) {
     super(options);
     this.resumeThreadId = options.initialSharedThreadId ?? null;
-    if (this.resumeThreadId) {
+    if (this.resumeThreadId && options.renderMode !== "panel") {
       this.state.sharedThreadId = this.resumeThreadId;
     }
   }
@@ -1685,19 +1712,10 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       throw new Error("Codex app-server is not ready.");
     }
 
-    const args = [
-      "--enable",
-      "tui_app_server",
-      "--remote",
-      `ws://${CODEX_APP_SERVER_HOST}:${this.appServerPort}`,
-    ];
-    if (this.options.renderMode !== "panel") {
-      args.push("--no-alt-screen");
-    }
-    if (this.options.profile) {
-      args.push("--profile", this.options.profile);
-    }
-    return args;
+    return buildCodexCliArgs(`ws://${CODEX_APP_SERVER_HOST}:${this.appServerPort}`, {
+      inlineMode: this.options.renderMode !== "panel",
+      profile: this.options.profile,
+    });
   }
 
   protected override afterStart(): void {
@@ -1754,6 +1772,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   override async resumeThread(threadId: string): Promise<void> {
+    if (this.isNativePanelMode()) {
+      throw new Error(
+        'WeChat /resume is disabled in codex mode. Use /resume directly inside "wechat-codex"; WeChat will follow the active local thread.',
+      );
+    }
     await this.resumeSharedThread(threadId);
   }
 
@@ -2579,7 +2602,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   private async restoreInitialSharedThreadIfNeeded(): Promise<void> {
-    if (!this.resumeThreadId) {
+    if (!this.resumeThreadId || this.isNativePanelMode()) {
       return;
     }
 
@@ -2667,7 +2690,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.updateSharedThread(resumedThreadId, {
       source: options.startup ? "restore" : "wechat",
       reason: options.startup ? "startup_restore" : "wechat_resume",
-      notify: Boolean(options.startup),
+      notify: true,
     });
   }
 
@@ -3208,12 +3231,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       trackedTurn.origin === "local" &&
       trackedTurn.threadId !== this.sharedThreadId
     ) {
-      this.updateSharedThread(trackedTurn.threadId, {
-        source: "local",
-        reason: "local_turn",
-        notify: true,
-      });
-      this.pendingThreadFollowId = null;
+      this.pendingThreadFollowId = trackedTurn.threadId;
     }
 
     if (!this.activeTurn) {

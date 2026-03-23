@@ -8,14 +8,12 @@ import { BridgeStateStore } from "./bridge-state.ts";
 import type {
   BridgeAdapter,
   BridgeAdapterKind,
-  BridgeResumeThreadCandidate,
   PendingApproval,
 } from "./bridge-types.ts";
 import {
   buildOneTimeCode,
   formatApprovalMessage,
   formatDuration,
-  formatResumeThreadList,
   formatStatusReport,
   formatThreadSwitchMessage,
   MESSAGE_START_GRACE_MS,
@@ -157,7 +155,6 @@ async function main(): Promise<void> {
   let activeTask: ActiveTask | null = null;
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
-  let lastResumeCandidates: BridgeResumeThreadCandidate[] = [];
 
   const queueWechatMessage = (senderId: string, text: string) => {
     sendChain = sendChain
@@ -230,7 +227,7 @@ async function main(): Promise<void> {
     log(`Authorized WeChat user: ${credentials.userId}`);
     if (options.adapter === "codex") {
       log(
-        'Start the visible Codex panel in a second terminal with: wechat-codex-panel',
+        'Start the visible Codex panel in a second terminal with: wechat-codex',
       );
     }
 
@@ -258,10 +255,6 @@ async function main(): Promise<void> {
             adapter,
             queueWechatMessage,
             outputBatcher,
-            getLastResumeCandidates: () => lastResumeCandidates,
-            setLastResumeCandidates: (candidates) => {
-              lastResumeCandidates = candidates;
-            },
           });
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
@@ -443,19 +436,8 @@ async function handleInboundMessage(params: {
   adapter: BridgeAdapter;
   queueWechatMessage: (senderId: string, text: string) => Promise<void>;
   outputBatcher: OutputBatcher;
-  getLastResumeCandidates: () => BridgeResumeThreadCandidate[];
-  setLastResumeCandidates: (candidates: BridgeResumeThreadCandidate[]) => void;
 }): Promise<ActiveTask | null> {
-  const {
-    message,
-    options,
-    stateStore,
-    adapter,
-    queueWechatMessage,
-    outputBatcher,
-    getLastResumeCandidates,
-    setLastResumeCandidates,
-  } = params;
+  const { message, options, stateStore, adapter, queueWechatMessage, outputBatcher } = params;
   const state = stateStore.getState();
   const systemCommand = parseSystemCommand(message.text);
 
@@ -475,63 +457,17 @@ async function handleInboundMessage(params: {
       );
       return null;
     case "resume": {
-      if (options.adapter !== "codex") {
+      if (options.adapter === "codex") {
         await queueWechatMessage(
           message.senderId,
-          "/resume is only supported when the bridge is running in codex mode.",
+          'WeChat /resume is disabled in codex mode. Use /resume directly inside "wechat-codex"; WeChat will follow the active local thread.',
         );
         return null;
       }
 
-      if (!systemCommand.target) {
-        const candidates = await adapter.listResumeThreads(10);
-        setLastResumeCandidates(candidates);
-        await queueWechatMessage(
-          message.senderId,
-          formatResumeThreadList(candidates, adapter.getState().sharedThreadId),
-        );
-        return null;
-      }
-
-      const rawTarget = systemCommand.target.trim();
-      const index = Number(rawTarget);
-      const threadId =
-        Number.isInteger(index) && String(index) === rawTarget
-          ? getLastResumeCandidates()[index - 1]?.threadId
-          : rawTarget;
-
-      if (!threadId) {
-        await queueWechatMessage(
-          message.senderId,
-          "Unknown resume target. Send /resume first, then /resume <number>, or use /resume <threadId> directly.",
-        );
-        return null;
-      }
-
-      if (state.pendingConfirmation) {
-        await queueWechatMessage(
-          message.senderId,
-          `Approval is pending for ${state.pendingConfirmation.commandPreview}. Reply with /confirm ${state.pendingConfirmation.code} or /deny before switching threads.`,
-        );
-        return null;
-      }
-
-      const adapterState = adapter.getState();
-      if (adapterState.status === "busy" || adapterState.status === "awaiting_approval") {
-        await queueWechatMessage(
-          message.senderId,
-          "codex is currently busy. Wait for the current turn to finish or use /stop before switching threads.",
-        );
-        return null;
-      }
-
-      await outputBatcher.flushNow();
-      outputBatcher.clear();
-      await adapter.resumeThread(threadId);
-      stateStore.appendLog(`Resumed Codex thread: ${threadId}`);
       await queueWechatMessage(
         message.senderId,
-        `Resumed Codex thread ${threadId.slice(0, 12)}.`,
+        "/resume is only supported when the bridge is running in codex mode.",
       );
       return null;
     }
@@ -550,7 +486,6 @@ async function handleInboundMessage(params: {
       outputBatcher.clear();
       stateStore.clearPendingConfirmation();
       stateStore.clearSharedThreadId();
-      setLastResumeCandidates([]);
       await adapter.reset();
       stateStore.appendLog("Worker reset by owner.");
       await queueWechatMessage(message.senderId, "Worker session has been reset.");
@@ -631,7 +566,6 @@ async function handleInboundMessage(params: {
     startedAt: Date.now(),
     inputPreview: truncatePreview(message.text, 180),
   };
-  setLastResumeCandidates([]);
   stateStore.appendLog(`Forwarded input to ${options.adapter}: ${truncatePreview(message.text)}`);
   await adapter.sendInput(message.text);
   return activeTask;

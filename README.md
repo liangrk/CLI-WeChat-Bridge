@@ -19,7 +19,7 @@ The bridge keeps one local session bridge alive and mirrors:
 
 Adapter behavior:
 
-- `codex` runs in two terminals: the bridge stays in one terminal, and the visible Codex panel runs in a second terminal via `wechat-codex-panel`
+- `codex` runs in two terminals: the bridge stays in one terminal, and the visible Codex panel runs in a second terminal via `wechat-codex`
 - `claude` and `powershell.exe` still use persistent interactive terminal sessions
 
 ## Requirements
@@ -67,15 +67,15 @@ wechat-bridge-shell
 5. If you started `wechat-bridge-codex`, open a second terminal in the same working directory and run:
 
 ```bash
-wechat-codex-panel
+wechat-codex
 ```
 
 6. After startup:
 
 - Send plain text to forward input to the active CLI session
-- In `codex` mode, local `/resume` and WeChat `/resume` share the same saved Codex threads
-- Use `/resume` to list recent saved Codex threads for the current repository
-- Use `/resume <number>` or `/resume <threadId>` to switch the shared Codex thread
+- In `codex` mode, the local `wechat-codex` panel is the only thread authority
+- Use `/resume` directly inside `wechat-codex` to switch Codex threads; WeChat follows the active local thread
+- WeChat `/resume` is disabled in `codex` mode so the local panel stays purely native
 - Use `/status` to inspect the bridge
 - Use `/stop` to send Ctrl+C
 - Use `/reset` to restart the local session
@@ -110,7 +110,7 @@ log instead of raw TUI frames.
 ```bash
 bun run setup
 wechat-bridge-codex
-wechat-codex-panel
+wechat-codex
 wechat-bridge-claude
 wechat-bridge-shell
 bun run bridge:codex                    # repo-local development entrypoint
@@ -137,8 +137,8 @@ bun run test
 - The bridge is single-owner by design. The owner is `account.json.userId`.
 - `shell` mode keeps a persistent PowerShell session and adds approval for risky commands.
 - Approval detection for `codex` and `claude` is text-pattern based. Verify it once on your machine.
-- `codex` should be started as a two-terminal workflow: bridge first, then `wechat-codex-panel` in a second terminal in the same working directory.
-- `codex` persists its normal session history under `~/.codex/sessions`, and the bridge restores the last shared thread on restart when possible.
+- `codex` should be started as a two-terminal workflow: bridge first, then `wechat-codex` in a second terminal in the same working directory.
+- `codex` persists its normal session history under `~/.codex/sessions`. Thread switching should be done locally inside `wechat-codex`, and WeChat follows that active thread.
 - WeChat intentionally does not receive raw Codex TUI frames, task summaries, or heartbeat spam.
 - The current WeChat ClawBot path still depends on the official iOS client feature set.
 
