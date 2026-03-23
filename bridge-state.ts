@@ -82,6 +82,12 @@ export class BridgeStateStore {
     this.acquireLock();
 
     const persisted = this.readStateFile();
+    const persistedSharedThreadId =
+      options.adapter === "codex" &&
+      persisted?.adapter === "codex" &&
+      persisted.cwd === options.cwd
+        ? persisted.sharedThreadId
+        : undefined;
     this.state = {
       instanceId: this.instanceId,
       adapter: options.adapter,
@@ -91,6 +97,7 @@ export class BridgeStateStore {
       authorizedUserId: options.authorizedUserId,
       bridgeStartedAtMs: this.bridgeStartedAtMs,
       ignoredBacklogCount: 0,
+      sharedThreadId: persistedSharedThreadId,
       lastActivityAt: persisted?.lastActivityAt,
       pendingConfirmation: null,
     };
@@ -126,6 +133,19 @@ export class BridgeStateStore {
 
   incrementIgnoredBacklog(count = 1): void {
     this.state.ignoredBacklogCount += count;
+    this.save();
+  }
+
+  setSharedThreadId(threadId: string): void {
+    this.state.sharedThreadId = threadId;
+    this.save();
+  }
+
+  clearSharedThreadId(): void {
+    if (!this.state.sharedThreadId) {
+      return;
+    }
+    this.state.sharedThreadId = undefined;
     this.save();
   }
 

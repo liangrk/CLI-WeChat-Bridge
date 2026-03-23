@@ -4,6 +4,7 @@ import type { BridgeAdapterState, BridgeState } from "./bridge-types.ts";
 import {
   buildOneTimeCode,
   detectCliApproval,
+  formatResumeThreadList,
   formatStatusReport,
   isHighRiskShellCommand,
   MESSAGE_START_GRACE_MS,
@@ -16,6 +17,8 @@ import {
 describe("parseSystemCommand", () => {
   test("parses supported control commands", () => {
     expect(parseSystemCommand("/status")).toEqual({ type: "status" });
+    expect(parseSystemCommand("/resume")).toEqual({ type: "resume" });
+    expect(parseSystemCommand("/resume 2")).toEqual({ type: "resume", target: "2" });
     expect(parseSystemCommand("/reset")).toEqual({ type: "reset" });
     expect(parseSystemCommand("/stop")).toEqual({ type: "stop" });
     expect(parseSystemCommand("/confirm 123456")).toEqual({
@@ -143,6 +146,7 @@ describe("formatStatusReport", () => {
       bridgeStartedAtMs: 1_700_000_000_000,
       authorizedUserId: "wx-owner",
       ignoredBacklogCount: 0,
+      sharedThreadId: "thread_persisted",
       pendingConfirmation: null,
       lastActivityAt: "2026-03-23T12:00:00.000Z",
     };
@@ -161,10 +165,37 @@ describe("formatStatusReport", () => {
       "shared_thread_id: thread_123",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
+      "persisted_shared_thread_id: thread_persisted",
+    );
+    expect(formatStatusReport(bridgeState, adapterState)).toContain(
       "active_turn_origin: local",
     );
     expect(formatStatusReport(bridgeState, adapterState)).toContain(
       "pending_approval_origin: local",
     );
+  });
+});
+
+describe("formatResumeThreadList", () => {
+  test("renders a numbered list and marks the current thread", () => {
+    const output = formatResumeThreadList(
+      [
+        {
+          threadId: "thread_1",
+          title: "Fix the bridge resume flow",
+          lastUpdatedAt: "2026-03-23T12:00:00.000Z",
+        },
+        {
+          threadId: "thread_2",
+          title: "Review README updates",
+          lastUpdatedAt: "2026-03-23T10:00:00.000Z",
+        },
+      ],
+      "thread_1",
+    );
+
+    expect(output).toContain("1. Fix the bridge resume flow");
+    expect(output).toContain("[current]");
+    expect(output).toContain("/resume <number>");
   });
 });

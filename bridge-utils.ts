@@ -1,6 +1,7 @@
 import type {
   ApprovalRequest,
   BridgeAdapterState,
+  BridgeResumeThreadCandidate,
   BridgeState,
   PendingApproval,
 } from "./bridge-types.ts";
@@ -11,6 +12,7 @@ const ANSI_ESCAPE_RE =
 
 export type SystemCommand =
   | { type: "status" }
+  | { type: "resume"; target?: string }
   | { type: "stop" }
   | { type: "reset" }
   | { type: "confirm"; code: string }
@@ -86,6 +88,8 @@ export function parseSystemCommand(text: string): SystemCommand | null {
   switch (command) {
     case "/status":
       return { type: "status" };
+    case "/resume":
+      return argument ? { type: "resume", target: argument } : { type: "resume" };
     case "/stop":
       return { type: "stop" };
     case "/reset":
@@ -254,6 +258,7 @@ export function formatStatusReport(
     `bridge_started_at: ${formatEpochMs(bridgeState.bridgeStartedAtMs)}`,
     `authorized_user: ${bridgeState.authorizedUserId}`,
     `ignored_backlog_count: ${bridgeState.ignoredBacklogCount}`,
+    `persisted_shared_thread_id: ${bridgeState.sharedThreadId ?? "(none)"}`,
     `worker_status: ${adapterState.status}`,
     `worker_pid: ${adapterState.pid ?? "(unknown)"}`,
     `shared_thread_id: ${adapterState.sharedThreadId ?? "(none)"}`,
@@ -264,6 +269,24 @@ export function formatStatusReport(
     `last_input_at: ${adapterState.lastInputAt ?? "(none)"}`,
     `last_output_at: ${adapterState.lastOutputAt ?? "(none)"}`,
     `pending_confirmation: ${pending ? `${pending.source}:${pending.code}` : "(none)"}`,
+  ].join("\n");
+}
+
+export function formatResumeThreadList(
+  candidates: BridgeResumeThreadCandidate[],
+  currentThreadId?: string,
+): string {
+  if (candidates.length === 0) {
+    return "No saved Codex threads were found for this working directory.";
+  }
+
+  return [
+    "Recent Codex threads:",
+    ...candidates.map((candidate, index) => {
+      const marker = currentThreadId && candidate.threadId === currentThreadId ? " [current]" : "";
+      return `${index + 1}. ${candidate.title} (${candidate.lastUpdatedAt}, ${candidate.threadId.slice(0, 12)})${marker}`;
+    }),
+    "Reply with /resume <number> or /resume <threadId>.",
   ].join("\n");
 }
 

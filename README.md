@@ -65,6 +65,9 @@ bun run codex:panel
 5. After startup:
 
 - Send plain text to forward input to the active CLI session
+- In `codex` mode, local `/resume` and WeChat `/resume` share the same saved Codex threads
+- Use `/resume` to list recent saved Codex threads for the current repository
+- Use `/resume <number>` or `/resume <threadId>` to switch the shared Codex thread
 - Use `/status` to inspect the bridge
 - Use `/stop` to send Ctrl+C
 - Use `/reset` to restart the local session
@@ -125,6 +128,7 @@ bun run test
 - `shell` mode keeps a persistent PowerShell session and adds approval for risky commands.
 - Approval detection for `codex` and `claude` is text-pattern based. Verify it once on your machine.
 - `codex` should be started as a two-terminal workflow: bridge first, then `bun run codex:panel` in a second terminal.
+- `codex` persists its normal session history under `~/.codex/sessions`, and the bridge restores the last shared thread on restart when possible.
 - WeChat intentionally does not receive raw Codex TUI frames, task summaries, or heartbeat spam.
 - The current WeChat ClawBot path still depends on the official iOS client feature set.
 

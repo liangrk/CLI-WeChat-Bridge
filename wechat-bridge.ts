@@ -8,12 +8,14 @@ import { BridgeStateStore } from "./bridge-state.ts";
 import type {
   BridgeAdapter,
   BridgeAdapterKind,
+  BridgeResumeThreadCandidate,
   PendingApproval,
 } from "./bridge-types.ts";
 import {
   buildOneTimeCode,
   formatApprovalMessage,
   formatDuration,
+  formatResumeThreadList,
   formatStatusReport,
   MESSAGE_START_GRACE_MS,
   nowIso,
@@ -147,11 +149,13 @@ async function main(): Promise<void> {
     command: options.command,
     cwd: options.cwd,
     profile: options.profile,
+    initialSharedThreadId: stateStore.getState().sharedThreadId,
   });
   let sendChain = Promise.resolve();
   let activeTask: ActiveTask | null = null;
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
+  let lastResumeCandidates: BridgeResumeThreadCandidate[] = [];
 
   const queueWechatMessage = (senderId: string, text: string) => {
     sendChain = sendChain
@@ -205,9 +209,13 @@ async function main(): Promise<void> {
       updateLastOutputAt: () => {
         lastOutputAt = Date.now();
       },
+      syncSharedThreadState: () => {
+        syncSharedThreadState(stateStore, adapter);
+      },
     });
 
     await adapter.start();
+    syncSharedThreadState(stateStore, adapter);
     stateStore.appendLog(
       `Bridge started with adapter=${options.adapter} command=${options.command} cwd=${options.cwd}`,
     );
@@ -246,6 +254,10 @@ async function main(): Promise<void> {
             adapter,
             queueWechatMessage,
             outputBatcher,
+            getLastResumeCandidates: () => lastResumeCandidates,
+            setLastResumeCandidates: (candidates) => {
+              lastResumeCandidates = candidates;
+            },
           });
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
@@ -257,6 +269,7 @@ async function main(): Promise<void> {
           activeTask = nextTask;
           lastHeartbeatAt = 0;
         }
+        syncSharedThreadState(stateStore, adapter);
       }
 
       const adapterState = adapter.getState();
@@ -280,6 +293,23 @@ async function main(): Promise<void> {
   }
 }
 
+function syncSharedThreadState(
+  stateStore: BridgeStateStore,
+  adapter: BridgeAdapter,
+): void {
+  const persistedThreadId = stateStore.getState().sharedThreadId;
+  const adapterThreadId = adapter.getState().sharedThreadId;
+
+  if (adapterThreadId && adapterThreadId !== persistedThreadId) {
+    stateStore.setSharedThreadId(adapterThreadId);
+    return;
+  }
+
+  if (!adapterThreadId && persistedThreadId) {
+    stateStore.clearSharedThreadId();
+  }
+}
+
 function wireAdapterEvents(params: {
   adapter: BridgeAdapter;
   options: BridgeCliOptions;
@@ -289,6 +319,7 @@ function wireAdapterEvents(params: {
   getActiveTask: () => ActiveTask | null;
   clearActiveTask: () => void;
   updateLastOutputAt: () => void;
+  syncSharedThreadState: () => void;
 }): void {
   const {
     adapter,
@@ -299,9 +330,11 @@ function wireAdapterEvents(params: {
     getActiveTask,
     clearActiveTask,
     updateLastOutputAt,
+    syncSharedThreadState,
   } = params;
 
   adapter.setEventSink((event) => {
+    syncSharedThreadState();
     const authorizedUserId = stateStore.getState().authorizedUserId;
 
     switch (event.type) {
@@ -395,6 +428,8 @@ async function handleInboundMessage(params: {
   adapter: BridgeAdapter;
   queueWechatMessage: (senderId: string, text: string) => Promise<void>;
   outputBatcher: OutputBatcher;
+  getLastResumeCandidates: () => BridgeResumeThreadCandidate[];
+  setLastResumeCandidates: (candidates: BridgeResumeThreadCandidate[]) => void;
 }): Promise<ActiveTask | null> {
   const {
     message,
@@ -403,6 +438,8 @@ async function handleInboundMessage(params: {
     adapter,
     queueWechatMessage,
     outputBatcher,
+    getLastResumeCandidates,
+    setLastResumeCandidates,
   } = params;
   const state = stateStore.getState();
   const systemCommand = parseSystemCommand(message.text);
@@ -422,6 +459,67 @@ async function handleInboundMessage(params: {
         formatStatusReport(stateStore.getState(), adapter.getState()),
       );
       return null;
+    case "resume": {
+      if (options.adapter !== "codex") {
+        await queueWechatMessage(
+          message.senderId,
+          "/resume is only supported when the bridge is running in codex mode.",
+        );
+        return null;
+      }
+
+      if (!systemCommand.target) {
+        const candidates = await adapter.listResumeThreads(10);
+        setLastResumeCandidates(candidates);
+        await queueWechatMessage(
+          message.senderId,
+          formatResumeThreadList(candidates, adapter.getState().sharedThreadId),
+        );
+        return null;
+      }
+
+      const rawTarget = systemCommand.target.trim();
+      const index = Number(rawTarget);
+      const threadId =
+        Number.isInteger(index) && String(index) === rawTarget
+          ? getLastResumeCandidates()[index - 1]?.threadId
+          : rawTarget;
+
+      if (!threadId) {
+        await queueWechatMessage(
+          message.senderId,
+          "Unknown resume target. Send /resume first, then /resume <number>, or use /resume <threadId> directly.",
+        );
+        return null;
+      }
+
+      if (state.pendingConfirmation) {
+        await queueWechatMessage(
+          message.senderId,
+          `Approval is pending for ${state.pendingConfirmation.commandPreview}. Reply with /confirm ${state.pendingConfirmation.code} or /deny before switching threads.`,
+        );
+        return null;
+      }
+
+      const adapterState = adapter.getState();
+      if (adapterState.status === "busy" || adapterState.status === "awaiting_approval") {
+        await queueWechatMessage(
+          message.senderId,
+          "codex is currently busy. Wait for the current turn to finish or use /stop before switching threads.",
+        );
+        return null;
+      }
+
+      await outputBatcher.flushNow();
+      outputBatcher.clear();
+      await adapter.resumeThread(threadId);
+      stateStore.appendLog(`Resumed Codex thread: ${threadId}`);
+      await queueWechatMessage(
+        message.senderId,
+        `Resumed Codex thread ${threadId.slice(0, 12)}.`,
+      );
+      return null;
+    }
     case "stop": {
       const interrupted = await adapter.interrupt();
       await queueWechatMessage(
@@ -436,6 +534,8 @@ async function handleInboundMessage(params: {
       await outputBatcher.flushNow();
       outputBatcher.clear();
       stateStore.clearPendingConfirmation();
+      stateStore.clearSharedThreadId();
+      setLastResumeCandidates([]);
       await adapter.reset();
       stateStore.appendLog("Worker reset by owner.");
       await queueWechatMessage(message.senderId, "Worker session has been reset.");
@@ -516,6 +616,7 @@ async function handleInboundMessage(params: {
     startedAt: Date.now(),
     inputPreview: truncatePreview(message.text, 180),
   };
+  setLastResumeCandidates([]);
   stateStore.appendLog(`Forwarded input to ${options.adapter}: ${truncatePreview(message.text)}`);
   await adapter.sendInput(message.text);
   return activeTask;

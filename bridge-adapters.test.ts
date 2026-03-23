@@ -8,6 +8,7 @@ import {
   buildCodexApprovalRequest,
   extractCodexFinalTextFromItem,
   extractCodexUserMessageText,
+  listCodexResumeThreads,
   matchesCodexSessionMeta,
   resolveSpawnTarget,
 } from "./bridge-adapters.ts";
@@ -25,6 +26,11 @@ function makeTempDirectory(): string {
 function writeFile(filePath: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, "", "utf-8");
+}
+
+function writeTextFile(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, content, "utf-8");
 }
 
 afterEach(() => {
@@ -218,20 +224,21 @@ describe("resolveSpawnTarget", () => {
 });
 
 describe("matchesCodexSessionMeta", () => {
-  test("matches the expected cwd and custom session source", () => {
+  test("matches the expected cwd and thread id", () => {
     const startedAtMs = Date.parse("2026-03-22T15:00:00.000Z");
 
     expect(
       matchesCodexSessionMeta(
         {
+          id: "thread_123",
           cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
-          source: { custom: "wechat_bridge" },
+          source: "cli",
           timestamp: "2026-03-22T15:00:02.000Z",
         },
         {
           cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
           startedAtMs,
-          sessionSource: "wechat_bridge",
+          threadId: "thread_123",
         },
       ),
     ).toBe(true);
@@ -243,6 +250,7 @@ describe("matchesCodexSessionMeta", () => {
     expect(
       matchesCodexSessionMeta(
         {
+          id: "thread_123",
           cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
           source: { custom: "cli" },
           timestamp: "2026-03-22T15:00:02.000Z",
@@ -262,6 +270,7 @@ describe("matchesCodexSessionMeta", () => {
     expect(
       matchesCodexSessionMeta(
         {
+          id: "thread_999",
           cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
           source: "wechat_bridge",
           timestamp: "2026-03-22T14:55:00.000Z",
@@ -379,5 +388,104 @@ describe("extractCodexUserMessageText", () => {
         ],
       }),
     ).toBe("[mention: repo]\n[local image: C:\\repo\\diagram.png]");
+  });
+});
+
+describe("listCodexResumeThreads", () => {
+  test("lists the latest saved threads for the current working directory", () => {
+    const homeDirectory = makeTempDirectory();
+    const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
+
+    process.env.HOME = homeDirectory;
+    process.env.USERPROFILE = homeDirectory;
+
+    try {
+      const sessionsRoot = path.join(homeDirectory, ".codex", "sessions", "2026", "03", "23");
+      const repoCwd = "C:\\repo";
+      const otherCwd = "C:\\other";
+
+      writeTextFile(
+        path.join(sessionsRoot, "thread-a.jsonl"),
+        [
+          JSON.stringify({
+            timestamp: "2026-03-23T10:00:00.000Z",
+            type: "session_meta",
+            payload: {
+              id: "thread_a",
+              timestamp: "2026-03-23T10:00:00.000Z",
+              cwd: repoCwd,
+              source: "cli",
+            },
+          }),
+          JSON.stringify({
+            timestamp: "2026-03-23T10:01:00.000Z",
+            type: "event_msg",
+            payload: {
+              type: "user_message",
+              message: "Inspect the current bridge implementation.",
+            },
+          }),
+        ].join("\n"),
+      );
+
+      writeTextFile(
+        path.join(sessionsRoot, "thread-b.jsonl"),
+        [
+          JSON.stringify({
+            timestamp: "2026-03-23T11:00:00.000Z",
+            type: "session_meta",
+            payload: {
+              id: "thread_b",
+              timestamp: "2026-03-23T11:00:00.000Z",
+              cwd: repoCwd,
+              source: "cli",
+            },
+          }),
+          JSON.stringify({
+            timestamp: "2026-03-23T11:02:00.000Z",
+            type: "event_msg",
+            payload: {
+              type: "user_message",
+              message: "Resume the latest saved thread.",
+            },
+          }),
+        ].join("\n"),
+      );
+
+      writeTextFile(
+        path.join(sessionsRoot, "thread-other.jsonl"),
+        [
+          JSON.stringify({
+            timestamp: "2026-03-23T12:00:00.000Z",
+            type: "session_meta",
+            payload: {
+              id: "thread_other",
+              timestamp: "2026-03-23T12:00:00.000Z",
+              cwd: otherCwd,
+              source: "cli",
+            },
+          }),
+        ].join("\n"),
+      );
+
+      const candidates = listCodexResumeThreads(repoCwd, 10);
+      expect(candidates).toHaveLength(2);
+      expect(candidates[0]?.threadId).toBe("thread_b");
+      expect(candidates[0]?.title).toContain("Resume the latest saved thread");
+      expect(candidates[1]?.threadId).toBe("thread_a");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+
+      if (previousUserProfile === undefined) {
+        delete process.env.USERPROFILE;
+      } else {
+        process.env.USERPROFILE = previousUserProfile;
+      }
+    }
   });
 });

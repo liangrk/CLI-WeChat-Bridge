@@ -20,6 +20,7 @@ import type {
   ApprovalRequest,
   BridgeAdapter,
   BridgeAdapterKind,
+  BridgeResumeThreadCandidate,
   BridgeAdapterState,
   BridgeEvent,
   BridgeTurnOrigin,
@@ -37,6 +38,7 @@ type AdapterOptions = {
   command: string;
   cwd: string;
   profile?: string;
+  initialSharedThreadId?: string;
   renderMode?: "embedded" | "panel";
 };
 
@@ -88,6 +90,14 @@ export type CodexSessionMeta = {
   originator?: string;
 };
 
+type CodexSessionSummary = {
+  threadId: string;
+  title: string;
+  lastUpdatedAt: string;
+  source?: string;
+  filePath: string;
+};
+
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 30;
 const WINDOWS_DIRECT_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ".com"];
@@ -98,7 +108,6 @@ const CODEX_RECENT_SESSION_KEY_LIMIT = 64;
 const INTERRUPT_SETTLE_DELAY_MS = 1_500;
 const CODEX_STARTUP_WARMUP_MS = 1_200;
 const CODEX_APP_SERVER_HOST = "127.0.0.1";
-const CODEX_APP_SERVER_SESSION_SOURCE = "wechat_bridge";
 const CODEX_APP_SERVER_READY_TIMEOUT_MS = 10_000;
 const CODEX_APP_SERVER_LOG_LIMIT = 12_000;
 const CODEX_RPC_CONNECT_RETRY_MS = 150;
@@ -618,6 +627,50 @@ function buildCodexSessionDayPath(date: Date): string | null {
   );
 }
 
+function buildCodexSessionsRoot(): string | null {
+  const homeDirectory = process.env.USERPROFILE ?? process.env.HOME;
+  if (!homeDirectory) {
+    return null;
+  }
+
+  return path.join(homeDirectory, ".codex", "sessions");
+}
+
+function listCodexSessionFilesRecursively(rootDirectory: string): string[] {
+  if (!fs.existsSync(rootDirectory)) {
+    return [];
+  }
+
+  const files: string[] = [];
+  const pending = [rootDirectory];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) {
+      continue;
+    }
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(entryPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        files.push(entryPath);
+      }
+    }
+  }
+
+  return files;
+}
+
 function readCodexSessionMeta(filePath: string): CodexSessionMeta | null {
   try {
     const firstLine = fs.readFileSync(filePath, "utf8").split(/\r?\n/, 1)[0]?.trim();
@@ -639,15 +692,107 @@ function readCodexSessionMeta(filePath: string): CodexSessionMeta | null {
   }
 }
 
+function getCodexSessionSource(meta: CodexSessionMeta | null | undefined): string | null {
+  if (!meta) {
+    return null;
+  }
+
+  if (typeof meta.source === "string") {
+    return meta.source;
+  }
+
+  if (isRecord(meta.source) && typeof meta.source.custom === "string") {
+    return meta.source.custom;
+  }
+
+  return null;
+}
+
+function parseCodexSessionUserMessage(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      type?: string;
+      payload?: {
+        type?: string;
+        message?: string;
+      };
+    };
+    if (parsed.type !== "event_msg" || parsed.payload?.type !== "user_message") {
+      return null;
+    }
+
+    const message =
+      typeof parsed.payload.message === "string"
+        ? normalizeOutput(parsed.payload.message).trim()
+        : "";
+    return message || null;
+  } catch {
+    return null;
+  }
+}
+
+function summarizeCodexSessionFile(filePath: string): CodexSessionSummary | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+
+  const lines = content.split(/\r?\n/).filter(Boolean);
+  const meta = readCodexSessionMeta(filePath);
+  if (!meta?.id || !meta.cwd) {
+    return null;
+  }
+
+  let lastTimestamp = meta.timestamp ?? null;
+  let lastUserMessage: string | null = null;
+  for (const line of lines) {
+    const parsedUserMessage = parseCodexSessionUserMessage(line);
+    if (parsedUserMessage) {
+      lastUserMessage = parsedUserMessage;
+    }
+
+    try {
+      const parsed = JSON.parse(line) as { timestamp?: string };
+      if (typeof parsed.timestamp === "string") {
+        lastTimestamp = parsed.timestamp;
+      }
+    } catch {
+      // Ignore malformed lines while summarizing persisted sessions.
+    }
+  }
+
+  const stats = fs.statSync(filePath);
+  const lastUpdatedAt =
+    lastTimestamp && Number.isFinite(Date.parse(lastTimestamp))
+      ? lastTimestamp
+      : new Date(stats.mtimeMs).toISOString();
+
+  return {
+    threadId: meta.id,
+    title: truncatePreview(lastUserMessage ?? meta.id, 120),
+    lastUpdatedAt,
+    source: getCodexSessionSource(meta) ?? undefined,
+    filePath,
+  };
+}
+
 export function matchesCodexSessionMeta(
   meta: CodexSessionMeta | null | undefined,
   options: {
     cwd: string;
     startedAtMs: number;
+    threadId?: string;
     sessionSource?: string;
   },
 ): boolean {
-  if (!meta?.cwd) {
+  if (!meta?.cwd || !meta.id) {
     return false;
   }
 
@@ -655,14 +800,17 @@ export function matchesCodexSessionMeta(
     return false;
   }
 
-  const sessionSource =
-    typeof meta.source === "string"
-      ? meta.source
-      : isRecord(meta.source) && typeof meta.source.custom === "string"
-        ? meta.source.custom
-        : null;
+  if (options.threadId && meta.id !== options.threadId) {
+    return false;
+  }
+
+  const sessionSource = getCodexSessionSource(meta);
   if (options.sessionSource && sessionSource !== options.sessionSource) {
     return false;
+  }
+
+  if (options.threadId) {
+    return true;
   }
 
   const sessionStartedAtMs = meta.timestamp ? Date.parse(meta.timestamp) : Number.NaN;
@@ -679,8 +827,36 @@ export function matchesCodexSessionMeta(
 function findCodexSessionFile(
   cwd: string,
   startedAtMs: number,
-  sessionSource?: string,
+  options: {
+    threadId?: string;
+    sessionSource?: string;
+  } = {},
 ): string | null {
+  if (options.threadId) {
+    const sessionsRoot = buildCodexSessionsRoot();
+    if (!sessionsRoot) {
+      return null;
+    }
+
+    const candidates = listCodexSessionFilesRecursively(sessionsRoot)
+      .map((filePath) => {
+        const meta = readCodexSessionMeta(filePath);
+        if (!matchesCodexSessionMeta(meta, { cwd, startedAtMs, ...options })) {
+          return null;
+        }
+
+        const stats = fs.statSync(filePath);
+        return {
+          filePath,
+          modifiedAtMs: stats.mtimeMs,
+        };
+      })
+      .filter((candidate): candidate is { filePath: string; modifiedAtMs: number } => Boolean(candidate))
+      .sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+
+    return candidates[0]?.filePath ?? null;
+  }
+
   const dayDirectories = [new Date(), new Date(startedAtMs), new Date(startedAtMs - 86_400_000)]
     .map(buildCodexSessionDayPath)
     .filter((value): value is string => Boolean(value))
@@ -706,7 +882,7 @@ function findCodexSessionFile(
       }
 
       const meta = readCodexSessionMeta(filePath);
-      if (!matchesCodexSessionMeta(meta, { cwd, startedAtMs, sessionSource })) {
+      if (!matchesCodexSessionMeta(meta, { cwd, startedAtMs, ...options })) {
         continue;
       }
 
@@ -734,6 +910,45 @@ function findCodexSessionFile(
   });
 
   return candidates[0]?.filePath ?? null;
+}
+
+export function listCodexResumeThreads(
+  cwd: string,
+  limit = 10,
+): BridgeResumeThreadCandidate[] {
+  const sessionsRoot = buildCodexSessionsRoot();
+  if (!sessionsRoot) {
+    return [];
+  }
+
+  const currentCwd = normalizeComparablePath(cwd);
+  const newestByThreadId = new Map<string, CodexSessionSummary>();
+  for (const filePath of listCodexSessionFilesRecursively(sessionsRoot)) {
+    const summary = summarizeCodexSessionFile(filePath);
+    if (!summary) {
+      continue;
+    }
+
+    const meta = readCodexSessionMeta(filePath);
+    if (!meta?.cwd || normalizeComparablePath(meta.cwd) !== currentCwd) {
+      continue;
+    }
+
+    const previous = newestByThreadId.get(summary.threadId);
+    if (!previous || Date.parse(summary.lastUpdatedAt) > Date.parse(previous.lastUpdatedAt)) {
+      newestByThreadId.set(summary.threadId, summary);
+    }
+  }
+
+  return Array.from(newestByThreadId.values())
+    .sort((left, right) => Date.parse(right.lastUpdatedAt) - Date.parse(left.lastUpdatedAt))
+    .slice(0, Math.max(1, limit))
+    .map((summary) => ({
+      threadId: summary.threadId,
+      title: summary.title,
+      lastUpdatedAt: summary.lastUpdatedAt,
+      source: summary.source,
+    }));
 }
 
 export function resolveSpawnTarget(
@@ -804,6 +1019,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
       cwd: options.cwd,
       command: options.command,
       profile: options.profile,
+      sharedThreadId: options.initialSharedThreadId,
     };
   }
 
@@ -844,6 +1060,7 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
           cwd: this.options.cwd,
           command: this.options.command,
           profile: this.options.profile,
+          sharedThreadId: this.state.sharedThreadId,
           startedAt: nowIso(),
         };
         writeCodexPanelEndpoint(this.endpoint);
@@ -856,6 +1073,21 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     await this.sendRequest({
       command: "send_input",
       text,
+    });
+  }
+
+  async listResumeThreads(limit = 10): Promise<BridgeResumeThreadCandidate[]> {
+    const result = await this.sendRequest({
+      command: "list_resume_threads",
+      limit,
+    });
+    return Array.isArray(result) ? (result as BridgeResumeThreadCandidate[]) : [];
+  }
+
+  async resumeThread(threadId: string): Promise<void> {
+    await this.sendRequest({
+      command: "resume_thread",
+      threadId,
     });
   }
 
@@ -971,7 +1203,19 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
         this.eventSink(message.event);
         return;
       case "state":
+        if (
+          this.endpoint &&
+          this.endpoint.sharedThreadId !== message.state.sharedThreadId
+        ) {
+          this.endpoint.sharedThreadId = message.state.sharedThreadId;
+          writeCodexPanelEndpoint(this.endpoint);
+        }
         Object.assign(this.state, message.state);
+        this.eventSink({
+          type: "status",
+          status: this.state.status,
+          timestamp: nowIso(),
+        });
         return;
       case "response": {
         const pending = this.pendingRequests.get(message.id);
@@ -1005,7 +1249,6 @@ class CodexPanelProxyAdapter implements BridgeAdapter {
     this.state.pendingApprovalOrigin = undefined;
     this.state.activeTurnId = undefined;
     this.state.activeTurnOrigin = undefined;
-    this.state.sharedThreadId = undefined;
   }
 
   private setStatus(status: BridgeAdapterState["status"], message?: string): void {
@@ -1134,6 +1377,14 @@ abstract class AbstractPtyAdapter implements BridgeAdapter {
     this.writeToPty(this.prepareInput(text));
     this.setStatus("busy");
     this.scheduleTaskComplete(this.defaultCompletionDelayMs());
+  }
+
+  async listResumeThreads(_limit = 10): Promise<BridgeResumeThreadCandidate[]> {
+    throw new Error("/resume is only supported for the codex adapter.");
+  }
+
+  async resumeThread(_threadId: string): Promise<void> {
+    throw new Error("/resume is only supported for the codex adapter.");
   }
 
   async interrupt(): Promise<boolean> {
@@ -1393,6 +1644,15 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }> = [];
   private localInputListener: ((chunk: string | Buffer) => void) | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
+  private resumeThreadId: string | null;
+
+  constructor(options: AdapterOptions) {
+    super(options);
+    this.resumeThreadId = options.initialSharedThreadId ?? null;
+    if (this.resumeThreadId) {
+      this.state.sharedThreadId = this.resumeThreadId;
+    }
+  }
 
   override async start(): Promise<void> {
     if (this.isCodexClientRunning()) {
@@ -1401,6 +1661,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
 
     await this.startAppServer();
     await this.connectRpcClient();
+    await this.restoreInitialSharedThreadIfNeeded();
 
     try {
       if (this.isNativePanelMode()) {
@@ -1482,6 +1743,14 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     await this.typeIntoPty(text.replace(/\r?\n/g, "\r"));
     await delay(40);
     this.writeToPty("\r");
+  }
+
+  override async listResumeThreads(limit = 10): Promise<BridgeResumeThreadCandidate[]> {
+    return listCodexResumeThreads(this.options.cwd, limit);
+  }
+
+  override async resumeThread(threadId: string): Promise<void> {
+    await this.resumeSharedThread(threadId);
   }
 
   override async interrupt(): Promise<boolean> {
@@ -1751,7 +2020,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       this.sessionFilePath = findCodexSessionFile(
         this.options.cwd,
         startedAtMs,
-        CODEX_APP_SERVER_SESSION_SOURCE,
+        { threadId: this.sharedThreadId ?? undefined },
       );
       if (!this.sessionFilePath) {
         return;
@@ -1843,12 +2112,6 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
           if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
             this.setStatus("busy", "Codex is busy with a local terminal turn.");
           }
-          this.emit({
-            type: "mirrored_user_input",
-            text: message,
-            timestamp,
-            origin: "local",
-          });
         }
         return;
       }
@@ -2082,8 +2345,6 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         "app-server",
         "--listen",
         `ws://${CODEX_APP_SERVER_HOST}:${port}`,
-        "--session-source",
-        CODEX_APP_SERVER_SESSION_SOURCE,
       ],
       {
         cwd: this.options.cwd,
@@ -2313,6 +2574,27 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     });
   }
 
+  private async restoreInitialSharedThreadIfNeeded(): Promise<void> {
+    if (!this.resumeThreadId) {
+      return;
+    }
+
+    const threadId = this.resumeThreadId;
+    this.resumeThreadId = null;
+
+    try {
+      await this.resumeSharedThread(threadId, { startup: true });
+    } catch (error) {
+      this.setSharedThreadId(null);
+      this.emit({
+        type: "status",
+        status: "starting",
+        message: `Failed to restore the previous Codex thread ${threadId.slice(0, 12)}. Starting without resume: ${describeUnknownError(error)}`,
+        timestamp: nowIso(),
+      });
+    }
+  }
+
   private async ensureThreadStarted(): Promise<string> {
     if (this.sharedThreadId) {
       return this.sharedThreadId;
@@ -2335,6 +2617,50 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
 
     this.setSharedThreadId(threadId);
     return threadId;
+  }
+
+  private async resumeSharedThread(
+    threadId: string,
+    options: { startup?: boolean } = {},
+  ): Promise<void> {
+    const trimmedThreadId = threadId.trim();
+    if (!trimmedThreadId) {
+      throw new Error("A thread id is required to resume a Codex thread.");
+    }
+
+    if (this.pendingApproval) {
+      throw new Error("A Codex approval request is pending. Reply with /confirm <code> or /deny.");
+    }
+
+    if (
+      !options.startup &&
+      (this.pendingTurnStart ||
+        this.activeTurn ||
+        this.state.status === "busy" ||
+        this.state.status === "awaiting_approval")
+    ) {
+      throw new Error("codex is still working. Wait for the current reply or use /stop.");
+    }
+
+    const response = await this.sendRpcRequest("thread/resume", {
+      threadId: trimmedThreadId,
+      cwd: this.options.cwd,
+      approvalPolicy: "on-request",
+      approvalsReviewer: "user",
+      sandbox: "workspace-write",
+    });
+
+    const resumedThreadId = this.extractThreadIdFromResponse(response);
+    if (!resumedThreadId) {
+      throw new Error("Codex did not return a thread id while resuming the saved thread.");
+    }
+
+    this.sessionFilePath = null;
+    this.sessionReadOffset = 0;
+    this.sessionPartialLine = "";
+    this.sessionFinalText = null;
+    this.pendingThreadFollowId = null;
+    this.setSharedThreadId(resumedThreadId);
   }
 
   private extractThreadIdFromResponse(response: unknown): string | null {
@@ -2437,8 +2763,20 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   private setSharedThreadId(threadId: string | null): void {
+    const previousThreadId = this.sharedThreadId;
     this.sharedThreadId = threadId;
     this.state.sharedThreadId = threadId ?? undefined;
+    if (previousThreadId !== threadId) {
+      this.sessionFilePath = null;
+      this.sessionReadOffset = 0;
+      this.sessionPartialLine = "";
+      this.sessionFinalText = null;
+      this.emit({
+        type: "status",
+        status: this.state.status,
+        timestamp: nowIso(),
+      });
+    }
   }
 
   private setActiveTurn(activeTurn: CodexActiveTurn | null): void {

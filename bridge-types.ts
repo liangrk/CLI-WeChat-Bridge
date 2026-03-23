@@ -24,6 +24,13 @@ export type PendingApproval = ApprovalRequest & {
   createdAt: string;
 };
 
+export type BridgeResumeThreadCandidate = {
+  threadId: string;
+  title: string;
+  lastUpdatedAt: string;
+  source?: string;
+};
+
 export type BridgeState = {
   instanceId: string;
   adapter: BridgeAdapterKind;
@@ -33,6 +40,7 @@ export type BridgeState = {
   bridgeStartedAtMs: number;
   authorizedUserId: string;
   ignoredBacklogCount: number;
+  sharedThreadId?: string;
   pendingConfirmation?: PendingApproval | null;
   lastActivityAt?: string;
 };
@@ -98,6 +106,8 @@ export interface BridgeAdapter {
   setEventSink(sink: (event: BridgeEvent) => void): void;
   start(): Promise<void>;
   sendInput(text: string): Promise<void>;
+  listResumeThreads(limit?: number): Promise<BridgeResumeThreadCandidate[]>;
+  resumeThread(threadId: string): Promise<void>;
   interrupt(): Promise<boolean>;
   reset(): Promise<void>;
   resolveApproval(action: "confirm" | "deny"): Promise<boolean>;

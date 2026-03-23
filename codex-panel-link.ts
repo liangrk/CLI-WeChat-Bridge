@@ -7,6 +7,8 @@ import type { BridgeAdapterState, BridgeEvent } from "./bridge-types.ts";
 
 export type CodexPanelCommand =
   | { command: "send_input"; text: string }
+  | { command: "list_resume_threads"; limit?: number }
+  | { command: "resume_thread"; threadId: string }
   | { command: "interrupt" }
   | { command: "reset" }
   | { command: "dispose" }
@@ -19,6 +21,7 @@ export type CodexPanelEndpoint = {
   cwd: string;
   command: string;
   profile?: string;
+  sharedThreadId?: string;
   startedAt: string;
 };
 
