@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
+import type { BridgeAdapterState, BridgeState } from "./bridge-types.ts";
 import {
   buildOneTimeCode,
   detectCliApproval,
+  formatStatusReport,
   isHighRiskShellCommand,
   MESSAGE_START_GRACE_MS,
   OutputBatcher,
@@ -128,5 +130,41 @@ describe("startup backlog filtering", () => {
     ).toBe(true);
     expect(shouldDropStartupBacklogMessage(startedAt, startedAt)).toBe(false);
     expect(shouldDropStartupBacklogMessage(undefined, startedAt)).toBe(true);
+  });
+});
+
+describe("formatStatusReport", () => {
+  test("includes shared-thread diagnostics for codex sessions", () => {
+    const bridgeState: BridgeState = {
+      instanceId: "bridge-test",
+      adapter: "codex",
+      command: "codex",
+      cwd: "C:\\repo",
+      bridgeStartedAtMs: 1_700_000_000_000,
+      authorizedUserId: "wx-owner",
+      ignoredBacklogCount: 0,
+      pendingConfirmation: null,
+      lastActivityAt: "2026-03-23T12:00:00.000Z",
+    };
+    const adapterState: BridgeAdapterState = {
+      kind: "codex",
+      status: "busy",
+      cwd: "C:\\repo",
+      command: "codex",
+      sharedThreadId: "thread_123",
+      activeTurnId: "turn_456",
+      activeTurnOrigin: "local",
+      pendingApprovalOrigin: "local",
+    };
+
+    expect(formatStatusReport(bridgeState, adapterState)).toContain(
+      "shared_thread_id: thread_123",
+    );
+    expect(formatStatusReport(bridgeState, adapterState)).toContain(
+      "active_turn_origin: local",
+    );
+    expect(formatStatusReport(bridgeState, adapterState)).toContain(
+      "pending_approval_origin: local",
+    );
   });
 });

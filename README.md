@@ -19,7 +19,7 @@ The bridge keeps one local session bridge alive and mirrors:
 
 Adapter behavior:
 
-- `codex` keeps a visible interactive panel in the current terminal and sends only final assistant replies back to WeChat
+- `codex` runs in two terminals: the bridge stays in one terminal, and the visible Codex panel runs in a second terminal via `bun run codex:panel`
 - `claude` and `powershell.exe` still use persistent interactive terminal sessions
 
 ## Requirements
@@ -56,7 +56,13 @@ bun run bridge:claude
 bun run bridge:shell
 ```
 
-4. After startup:
+4. If you started `bridge:codex`, open a second terminal in the same repository and run:
+
+```bash
+bun run codex:panel
+```
+
+5. After startup:
 
 - Send plain text to forward input to the active CLI session
 - Use `/status` to inspect the bridge
@@ -84,14 +90,16 @@ The bridge also resolves Windows launchers more carefully:
 - `claude.exe` is launched directly when present
 
 For `codex`, the bridge also starts a private local app-server and connects the
-visible TUI client to it. This keeps the terminal panel interactive while the
-bridge extracts clean final replies for WeChat from the Codex session log.
+visible TUI client to it. The bridge terminal stays clean, the second terminal
+shows the visible panel, and WeChat replies are extracted from the Codex session
+log instead of raw TUI frames.
 
 ## Scripts
 
 ```bash
 bun run setup
 bun run bridge:codex
+bun run codex:panel
 bun run bridge:claude
 bun run bridge:shell
 bun run bridge:bun -- --adapter codex   # legacy Bun entrypoint for debugging
@@ -116,7 +124,7 @@ bun run test
 - The bridge is single-owner by design. The owner is `account.json.userId`.
 - `shell` mode keeps a persistent PowerShell session and adds approval for risky commands.
 - Approval detection for `codex` and `claude` is text-pattern based. Verify it once on your machine.
-- `codex` shows its panel in the same terminal that launched `bun run bridge:codex`.
+- `codex` should be started as a two-terminal workflow: bridge first, then `bun run codex:panel` in a second terminal.
 - WeChat intentionally does not receive raw Codex TUI frames, task summaries, or heartbeat spam.
 - The current WeChat ClawBot path still depends on the official iOS client feature set.
 

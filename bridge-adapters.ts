@@ -2,16 +2,27 @@ import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import { spawn as spawnChild } from "node:child_process";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { spawn as spawnPty } from "node-pty";
 import type { IPty } from "node-pty";
 
+import {
+  attachCodexPanelMessageListener,
+  buildCodexPanelToken,
+  clearCodexPanelEndpoint,
+  sendCodexPanelMessage,
+  writeCodexPanelEndpoint,
+  type CodexPanelCommand,
+  type CodexPanelEndpoint,
+  type CodexPanelMessage,
+} from "./codex-panel-link.ts";
 import type {
   ApprovalRequest,
   BridgeAdapter,
   BridgeAdapterKind,
   BridgeAdapterState,
   BridgeEvent,
+  BridgeTurnOrigin,
 } from "./bridge-types.ts";
 import {
   detectCliApproval,
@@ -26,6 +37,7 @@ type AdapterOptions = {
   command: string;
   cwd: string;
   profile?: string;
+  renderMode?: "embedded" | "panel";
 };
 
 type EventSink = (event: BridgeEvent) => void;
@@ -57,13 +69,23 @@ type CodexQueuedNotification = {
 type CodexPendingApprovalRequest = {
   requestId: CodexRpcRequestId;
   method: "item/commandExecution/requestApproval" | "item/fileChange/requestApproval";
+  threadId: string;
+  turnId: string;
+  origin: BridgeTurnOrigin;
+};
+
+type CodexActiveTurn = {
+  threadId: string;
+  turnId: string;
+  origin: BridgeTurnOrigin;
 };
 
 export type CodexSessionMeta = {
   id?: string;
   timestamp?: string;
   cwd?: string;
-  source?: string;
+  source?: string | { custom?: string };
+  originator?: string;
 };
 
 const DEFAULT_COLS = 120;
@@ -71,7 +93,7 @@ const DEFAULT_ROWS = 30;
 const WINDOWS_DIRECT_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ".com"];
 const WINDOWS_POWERSHELL_EXTENSION = ".ps1";
 const CODEX_SESSION_POLL_INTERVAL_MS = 500;
-const CODEX_SESSION_MATCH_WINDOW_MS = 120_000;
+const CODEX_SESSION_MATCH_WINDOW_MS = 30_000;
 const CODEX_RECENT_SESSION_KEY_LIMIT = 64;
 const INTERRUPT_SETTLE_DELAY_MS = 1_500;
 const CODEX_STARTUP_WARMUP_MS = 1_200;
@@ -216,6 +238,38 @@ export function extractCodexFinalTextFromItem(item: unknown): string | null {
   }
 
   const text = typeof item.text === "string" ? normalizeOutput(item.text).trim() : "";
+  return text || null;
+}
+
+export function extractCodexUserMessageText(item: unknown): string | null {
+  if (!isRecord(item) || item.type !== "userMessage" || !Array.isArray(item.content)) {
+    return null;
+  }
+
+  const parts = item.content
+    .map((entry) => {
+      if (!isRecord(entry) || typeof entry.type !== "string") {
+        return "";
+      }
+
+      switch (entry.type) {
+        case "text":
+          return typeof entry.text === "string" ? entry.text : "";
+        case "image":
+          return "[image]";
+        case "localImage":
+          return typeof entry.path === "string" ? `[local image: ${entry.path}]` : "[local image]";
+        case "skill":
+          return typeof entry.name === "string" ? `[skill: ${entry.name}]` : "[skill]";
+        case "mention":
+          return typeof entry.name === "string" ? `[mention: ${entry.name}]` : "[mention]";
+        default:
+          return "";
+      }
+    })
+    .filter(Boolean);
+
+  const text = normalizeOutput(parts.join("\n")).trim();
   return text || null;
 }
 
@@ -601,7 +655,13 @@ export function matchesCodexSessionMeta(
     return false;
   }
 
-  if (options.sessionSource && meta.source !== options.sessionSource) {
+  const sessionSource =
+    typeof meta.source === "string"
+      ? meta.source
+      : isRecord(meta.source) && typeof meta.source.custom === "string"
+        ? meta.source.custom
+        : null;
+  if (options.sessionSource && sessionSource !== options.sessionSource) {
     return false;
   }
 
@@ -716,6 +776,276 @@ export function resolveSpawnTarget(
   }
 
   return { file: resolved, args: [...forwardArgs] };
+}
+
+class CodexPanelProxyAdapter implements BridgeAdapter {
+  private readonly options: AdapterOptions;
+  private readonly state: BridgeAdapterState;
+  private eventSink: EventSink = () => undefined;
+  private server: net.Server | null = null;
+  private socket: net.Socket | null = null;
+  private detachMessageListener: (() => void) | null = null;
+  private requestCounter = 0;
+  private endpoint: CodexPanelEndpoint | null = null;
+  private readonly pendingRequests = new Map<
+    string,
+    {
+      resolve: (value: unknown) => void;
+      reject: (reason?: unknown) => void;
+    }
+  >();
+  private shuttingDown = false;
+
+  constructor(options: AdapterOptions) {
+    this.options = options;
+    this.state = {
+      kind: options.kind,
+      status: "stopped",
+      cwd: options.cwd,
+      command: options.command,
+      profile: options.profile,
+    };
+  }
+
+  setEventSink(sink: EventSink): void {
+    this.eventSink = sink;
+  }
+
+  async start(): Promise<void> {
+    if (this.server) {
+      return;
+    }
+
+    this.shuttingDown = false;
+    this.setStatus(
+      "starting",
+      'Waiting for manual Codex panel connection. Run "bun run codex:panel" in a second terminal.',
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      const server = net.createServer((socket) => {
+        this.handlePanelSocket(socket);
+      });
+      this.server = server;
+      server.on("error", (error) => {
+        reject(error);
+      });
+      server.listen(0, CODEX_APP_SERVER_HOST, () => {
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          reject(new Error("Failed to allocate a local Codex panel port."));
+          return;
+        }
+
+        this.endpoint = {
+          instanceId: `${process.pid}-${Date.now().toString(36)}`,
+          port: address.port,
+          token: buildCodexPanelToken(),
+          cwd: this.options.cwd,
+          command: this.options.command,
+          profile: this.options.profile,
+          startedAt: nowIso(),
+        };
+        writeCodexPanelEndpoint(this.endpoint);
+        resolve();
+      });
+    });
+  }
+
+  async sendInput(text: string): Promise<void> {
+    await this.sendRequest({
+      command: "send_input",
+      text,
+    });
+  }
+
+  async interrupt(): Promise<boolean> {
+    const result = await this.sendRequest({
+      command: "interrupt",
+    });
+    return Boolean(result);
+  }
+
+  async reset(): Promise<void> {
+    await this.sendRequest({
+      command: "reset",
+    });
+  }
+
+  async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
+    const result = await this.sendRequest({
+      command: "resolve_approval",
+      action,
+    });
+    return Boolean(result);
+  }
+
+  async dispose(): Promise<void> {
+    this.shuttingDown = true;
+    this.rejectPendingRequests("Codex panel proxy is shutting down.");
+    clearCodexPanelEndpoint(this.endpoint?.instanceId);
+
+    if (this.socket) {
+      try {
+        sendCodexPanelMessage(this.socket, {
+          type: "request",
+          id: `${++this.requestCounter}`,
+          payload: { command: "dispose" },
+        });
+      } catch {
+        // Best effort.
+      }
+      this.detachPanelSocket();
+    }
+
+    if (!this.server) {
+      this.state.status = "stopped";
+      return;
+    }
+
+    const server = this.server;
+    this.server = null;
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+    this.state.status = "stopped";
+  }
+
+  getState(): BridgeAdapterState {
+    return JSON.parse(JSON.stringify(this.state)) as BridgeAdapterState;
+  }
+
+  private handlePanelSocket(socket: net.Socket): void {
+    if (!this.endpoint) {
+      socket.destroy();
+      return;
+    }
+
+    if (this.socket) {
+      socket.end();
+      socket.destroy();
+      return;
+    }
+
+    let authenticated = false;
+    socket.setNoDelay(true);
+    const detachListener = attachCodexPanelMessageListener(socket, (message) => {
+      if (!authenticated) {
+        if (
+          message.type !== "hello" ||
+          message.token !== this.endpoint?.token
+        ) {
+          socket.destroy();
+          return;
+        }
+
+        authenticated = true;
+        this.socket = socket;
+        this.detachMessageListener = detachListener;
+        sendCodexPanelMessage(socket, { type: "hello_ack" });
+        return;
+      }
+
+      this.handlePanelMessage(message);
+    });
+
+    socket.once("close", () => {
+      if (this.socket === socket) {
+        this.detachPanelSocket();
+        if (!this.shuttingDown) {
+          this.setStatus(
+            "starting",
+            'Codex panel disconnected. Run "bun run codex:panel" again in a second terminal.',
+          );
+        }
+      }
+    });
+    socket.once("error", () => {
+      socket.destroy();
+    });
+  }
+
+  private handlePanelMessage(message: CodexPanelMessage): void {
+    switch (message.type) {
+      case "event":
+        this.eventSink(message.event);
+        return;
+      case "state":
+        Object.assign(this.state, message.state);
+        return;
+      case "response": {
+        const pending = this.pendingRequests.get(message.id);
+        if (!pending) {
+          return;
+        }
+        this.pendingRequests.delete(message.id);
+        if (!message.ok) {
+          pending.reject(new Error(message.error ?? "Unknown Codex panel error."));
+          return;
+        }
+        pending.resolve(message.result);
+        return;
+      }
+    }
+  }
+
+  private detachPanelSocket(): void {
+    this.detachMessageListener?.();
+    this.detachMessageListener = null;
+    if (this.socket) {
+      this.socket.removeAllListeners();
+      this.socket.destroy();
+      this.socket = null;
+    }
+    this.state.pid = undefined;
+    this.state.startedAt = undefined;
+    this.state.lastInputAt = undefined;
+    this.state.lastOutputAt = undefined;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+    this.state.activeTurnId = undefined;
+    this.state.activeTurnOrigin = undefined;
+    this.state.sharedThreadId = undefined;
+  }
+
+  private setStatus(status: BridgeAdapterState["status"], message?: string): void {
+    this.state.status = status;
+    this.eventSink({
+      type: "status",
+      status,
+      message,
+      timestamp: nowIso(),
+    });
+  }
+
+  private rejectPendingRequests(message: string): void {
+    for (const pending of this.pendingRequests.values()) {
+      pending.reject(new Error(message));
+    }
+    this.pendingRequests.clear();
+  }
+
+  private async sendRequest(payload: CodexPanelCommand): Promise<unknown> {
+    const socket = this.socket;
+    if (!socket) {
+      throw new Error('Codex panel is not connected. Run "bun run codex:panel" in a second terminal.');
+    }
+    if (!this.state.pid && payload.command !== "dispose") {
+      throw new Error("Codex panel is connected but not ready yet. Wait for the panel to finish starting.");
+    }
+
+    const id = `${++this.requestCounter}`;
+    const response = new Promise<unknown>((resolve, reject) => {
+      this.pendingRequests.set(id, { resolve, reject });
+    });
+
+    sendCodexPanelMessage(socket, {
+      type: "request",
+      id,
+      payload,
+    });
+    return await response;
+  }
 }
 
 abstract class AbstractPtyAdapter implements BridgeAdapter {
@@ -1021,6 +1351,7 @@ abstract class AbstractPtyAdapter implements BridgeAdapter {
 
 class CodexPtyAdapter extends AbstractPtyAdapter {
   private appServer: ChildProcessWithoutNullStreams | null = null;
+  private nativeProcess: ChildProcess | null = null;
   private appServerPort: number | null = null;
   private appServerShuttingDown = false;
   private appServerLog = "";
@@ -1028,10 +1359,13 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   private rpcShuttingDown = false;
   private rpcRequestCounter = 0;
   private pendingRpcRequests = new Map<string, CodexRpcPendingRequest>();
-  private currentThreadId: string | null = null;
-  private currentTurnId: string | null = null;
+  private sharedThreadId: string | null = null;
+  private activeTurn: CodexActiveTurn | null = null;
+  private bridgeOwnedTurnIds = new Set<string>();
   private pendingTurnStart = false;
+  private pendingTurnThreadId: string | null = null;
   private interruptPendingTurnStart = false;
+  private pendingThreadFollowId: string | null = null;
   private pendingApprovalRequest: CodexPendingApprovalRequest | null = null;
   private queuedTurnNotifications: CodexQueuedNotification[] = [];
   private queuedTurnServerRequests: Array<{
@@ -1039,16 +1373,29 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     method: CodexPendingApprovalRequest["method"];
     params: Record<string, unknown>;
   }> = [];
-  private currentTurnFinalMessages = new Map<string, string>();
-  private currentTurnDeltaByItem = new Map<string, string>();
-  private currentTurnError: string | null = null;
+  private mirroredUserInputTurnIds = new Set<string>();
+  private turnFinalMessages = new Map<string, Map<string, string>>();
+  private turnDeltaByItem = new Map<string, Map<string, string>>();
+  private turnErrorById = new Map<string, string>();
   private startupBlocker: string | null = null;
   private warmupUntilMs = 0;
+  private sessionFilePath: string | null = null;
+  private sessionPollTimer: ReturnType<typeof setInterval> | null = null;
+  private sessionReadOffset = 0;
+  private sessionPartialLine = "";
+  private sessionFinalText: string | null = null;
+  private completedTurnIds = new Set<string>();
+  private completedTurnOrder: string[] = [];
+  private pendingInjectedInputs: Array<{
+    text: string;
+    normalizedText: string;
+    createdAtMs: number;
+  }> = [];
   private localInputListener: ((chunk: string | Buffer) => void) | null = null;
   private interruptTimer: ReturnType<typeof setTimeout> | null = null;
 
   override async start(): Promise<void> {
-    if (this.pty) {
+    if (this.isCodexClientRunning()) {
       return;
     }
 
@@ -1056,7 +1403,11 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     await this.connectRpcClient();
 
     try {
-      await super.start();
+      if (this.isNativePanelMode()) {
+        await this.startNativeClient();
+      } else {
+        await super.start();
+      }
     } catch (err) {
       await this.disconnectRpcClient();
       await this.stopAppServer();
@@ -1074,8 +1425,10 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       "tui_app_server",
       "--remote",
       `ws://${CODEX_APP_SERVER_HOST}:${this.appServerPort}`,
-      "--no-alt-screen",
     ];
+    if (this.options.renderMode !== "panel") {
+      args.push("--no-alt-screen");
+    }
     if (this.options.profile) {
       args.push("--profile", this.options.profile);
     }
@@ -1083,12 +1436,22 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   protected override afterStart(): void {
-    this.warmupUntilMs = Date.now() + CODEX_STARTUP_WARMUP_MS;
-    this.attachLocalInputForwarding();
+    this.warmupUntilMs = this.isNativePanelMode()
+      ? 0
+      : Date.now() + CODEX_STARTUP_WARMUP_MS;
+    if (!this.isNativePanelMode()) {
+      this.attachLocalInputForwarding();
+    }
+    this.startSessionPolling();
   }
 
   override async sendInput(text: string): Promise<void> {
-    if (!this.pty || !this.rpcSocket) {
+    if (this.isNativePanelMode()) {
+      await this.sendPanelTurn(text);
+      return;
+    }
+
+    if (!this.pty) {
       throw new Error("codex adapter is not running.");
     }
     if (this.state.status === "busy") {
@@ -1113,85 +1476,66 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.hasAcceptedInput = true;
     this.currentPreview = truncatePreview(text);
     this.state.lastInputAt = nowIso();
+    this.rememberInjectedInput(text);
     this.setStatus("busy");
-
-    this.resetCurrentTurnState({ preserveThread: true });
-
-    try {
-      const threadId = await this.ensureThreadStarted();
-      this.pendingTurnStart = true;
-
-      const response = await this.sendRpcRequest("turn/start", {
-        threadId,
-        input: [
-          {
-            type: "text",
-            text,
-            text_elements: [],
-          },
-        ],
-        cwd: this.options.cwd,
-      });
-
-      const turnId = this.extractTurnIdFromResponse(response);
-      if (!turnId) {
-        throw new Error("Codex did not return a turn id for this request.");
-      }
-
-      this.bindCurrentTurn(turnId);
-      if (this.interruptPendingTurnStart) {
-        await this.requestActiveTurnInterrupt();
-      }
-    } catch (err) {
-      this.resetCurrentTurnState({ preserveThread: true });
-      this.setStatus("idle");
-      throw err;
-    }
+    this.state.activeTurnOrigin = "wechat";
+    await this.typeIntoPty(text.replace(/\r?\n/g, "\r"));
+    await delay(40);
+    this.writeToPty("\r");
   }
 
   override async interrupt(): Promise<boolean> {
-    if (!this.rpcSocket || !this.currentThreadId) {
+    if (this.isNativePanelMode()) {
+      return await this.interruptPanelTurn();
+    }
+
+    if (!this.pty) {
       return false;
     }
 
-    if (this.pendingTurnStart && !this.currentTurnId) {
-      this.interruptPendingTurnStart = true;
-      this.armInterruptFallback();
-      return true;
-    }
-
-    if (!this.currentTurnId) {
+    if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
       return false;
     }
 
-    this.pendingApproval = null;
-    this.state.pendingApproval = null;
-    this.pendingApprovalRequest = null;
-    this.interruptPendingTurnStart = false;
-    await this.requestActiveTurnInterrupt();
+    this.clearPendingApprovalState();
+    this.writeToPty("\u0003");
     this.armInterruptFallback();
     return true;
   }
 
   override async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
-    if (!this.pendingApproval || !this.pendingApprovalRequest || !this.rpcSocket) {
+    if (!this.pendingApproval) {
       return false;
     }
 
-    const request = this.pendingApprovalRequest;
-    await this.respondToApprovalRequest(request, action);
-    this.pendingApprovalRequest = null;
-    this.pendingApproval = null;
-    this.state.pendingApproval = null;
-    this.setStatus("busy");
-    return true;
+    if (this.pendingApprovalRequest && this.rpcSocket) {
+      const request = this.pendingApprovalRequest;
+      await this.respondToApprovalRequest(request, action);
+      this.clearPendingApprovalState();
+      this.setStatus("busy");
+      return true;
+    }
+
+    return await super.resolveApproval(action);
   }
 
   override async dispose(): Promise<void> {
-    this.resetCurrentTurnState({ preserveThread: false });
-    this.detachLocalInputForwarding();
+    this.resetTurnTracking({ preserveThread: false });
+    if (!this.isNativePanelMode()) {
+      this.detachLocalInputForwarding();
+    }
+    this.stopSessionPolling();
     await this.disconnectRpcClient();
-    await super.dispose();
+    if (this.isNativePanelMode()) {
+      await this.stopNativeClient();
+      this.clearCompletionTimer();
+      this.pendingApproval = null;
+      this.state.pendingApproval = null;
+      this.state.status = "stopped";
+      this.state.pid = undefined;
+    } else {
+      await super.dispose();
+    }
     await this.stopAppServer();
   }
 
@@ -1207,6 +1551,17 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     const approval = detectCliApproval(text);
 
     if (this.hasAcceptedInput) {
+      if (approval && !this.pendingApproval) {
+        this.pendingApproval = approval;
+        this.state.pendingApproval = approval;
+        this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
+        this.setStatus("awaiting_approval", "Codex approval is required.");
+        this.emit({
+          type: "approval_required",
+          request: approval,
+          timestamp: nowIso(),
+        });
+      }
       return;
     }
 
@@ -1227,11 +1582,489 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   protected override handleExit(exitCode: number | undefined): void {
-    this.resetCurrentTurnState({ preserveThread: false });
+    this.resetTurnTracking({ preserveThread: false });
     this.detachLocalInputForwarding();
+    this.stopSessionPolling();
     void this.disconnectRpcClient();
     void this.stopAppServer();
     super.handleExit(exitCode);
+  }
+
+  private isNativePanelMode(): boolean {
+    return this.options.renderMode === "panel";
+  }
+
+  private isCodexClientRunning(): boolean {
+    return this.isNativePanelMode() ? Boolean(this.nativeProcess) : Boolean(this.pty);
+  }
+
+  private async startNativeClient(): Promise<void> {
+    this.setStatus("starting", `Starting ${this.options.kind} adapter...`);
+
+    let spawnTarget: SpawnTarget | null = null;
+    try {
+      spawnTarget = resolveSpawnTarget(this.options.command, this.options.kind);
+      const child = spawnChild(
+        spawnTarget.file,
+        [...spawnTarget.args, ...this.buildSpawnArgs()],
+        {
+          cwd: this.options.cwd,
+          env: this.buildEnv(),
+          stdio: "inherit",
+          windowsHide: false,
+        },
+      );
+
+      this.nativeProcess = child;
+      this.shuttingDown = false;
+      this.hasAcceptedInput = false;
+      this.state.pid = child.pid ?? undefined;
+      this.state.startedAt = nowIso();
+      this.state.status = "idle";
+      this.state.pendingApproval = null;
+
+      child.once("error", (error) => {
+        if (this.nativeProcess === child) {
+          this.handleNativeExit(undefined, undefined, error);
+        }
+      });
+      child.once("exit", (exitCode, signal) => {
+        if (this.nativeProcess === child) {
+          this.handleNativeExit(exitCode ?? undefined, signal ?? undefined);
+        }
+      });
+
+      this.afterStart();
+      this.setStatus("idle", `${this.options.kind} adapter is ready.`);
+    } catch (err) {
+      this.state.status = "error";
+      this.emit({
+        type: "fatal_error",
+        message: `Failed to start ${this.options.kind}${spawnTarget ? ` (${spawnTarget.file})` : ""}: ${String(err)}`,
+        timestamp: nowIso(),
+      });
+      throw err;
+    }
+  }
+
+  private handleNativeExit(
+    exitCode: number | undefined,
+    signal?: NodeJS.Signals,
+    startupError?: Error,
+  ): void {
+    this.clearCompletionTimer();
+    this.resetTurnTracking({ preserveThread: false });
+    this.stopSessionPolling();
+    void this.disconnectRpcClient();
+    void this.stopAppServer();
+
+    const expectedShutdown = this.shuttingDown;
+    this.shuttingDown = false;
+    this.nativeProcess = null;
+    this.state.status = "stopped";
+    this.state.pid = undefined;
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+
+    if (expectedShutdown) {
+      this.emit({
+        type: "status",
+        status: "stopped",
+        message: `${this.options.kind} worker stopped.`,
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
+    const exitLabel = startupError
+      ? startupError.message
+      : signal
+        ? `signal ${signal}`
+        : typeof exitCode === "number"
+          ? `code ${exitCode}`
+          : "an unknown code";
+    this.emit({
+      type: "fatal_error",
+      message: `${this.options.kind} worker exited unexpectedly with ${exitLabel}.`,
+      timestamp: nowIso(),
+    });
+  }
+
+  private async stopNativeClient(): Promise<void> {
+    if (!this.nativeProcess) {
+      this.state.pid = undefined;
+      return;
+    }
+
+    const child = this.nativeProcess;
+    this.shuttingDown = true;
+    this.nativeProcess = null;
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve();
+      };
+      child.once("exit", () => finish());
+      try {
+        child.kill();
+      } catch {
+        finish();
+      }
+      const timer = setTimeout(() => finish(), 1_500);
+      timer.unref?.();
+    });
+  }
+
+  private startSessionPolling(): void {
+    this.stopSessionPolling();
+    const poll = () => {
+      void this.pollSessionLog();
+    };
+    this.sessionPollTimer = setInterval(poll, CODEX_SESSION_POLL_INTERVAL_MS);
+    this.sessionPollTimer.unref?.();
+    poll();
+  }
+
+  private stopSessionPolling(): void {
+    if (this.sessionPollTimer) {
+      clearInterval(this.sessionPollTimer);
+      this.sessionPollTimer = null;
+    }
+    this.sessionFilePath = null;
+    this.sessionReadOffset = 0;
+    this.sessionPartialLine = "";
+    this.sessionFinalText = null;
+  }
+
+  private async pollSessionLog(): Promise<void> {
+    if (!this.isCodexClientRunning()) {
+      return;
+    }
+
+    if (!this.sessionFilePath) {
+      const startedAtMs = this.state.startedAt ? Date.parse(this.state.startedAt) : Date.now();
+      this.sessionFilePath = findCodexSessionFile(
+        this.options.cwd,
+        startedAtMs,
+        CODEX_APP_SERVER_SESSION_SOURCE,
+      );
+      if (!this.sessionFilePath) {
+        return;
+      }
+      this.sessionReadOffset = 0;
+      this.sessionPartialLine = "";
+    }
+
+    let content: string;
+    try {
+      content = fs.readFileSync(this.sessionFilePath, "utf8");
+    } catch {
+      this.sessionFilePath = null;
+      this.sessionReadOffset = 0;
+      this.sessionPartialLine = "";
+      return;
+    }
+
+    if (content.length < this.sessionReadOffset) {
+      this.sessionReadOffset = 0;
+      this.sessionPartialLine = "";
+    }
+    if (content.length === this.sessionReadOffset) {
+      return;
+    }
+
+    const chunk = content.slice(this.sessionReadOffset);
+    this.sessionReadOffset = content.length;
+    const lines = `${this.sessionPartialLine}${chunk}`.split(/\r?\n/);
+    this.sessionPartialLine = lines.pop() ?? "";
+
+    for (const line of lines) {
+      this.handleSessionLogLine(line);
+    }
+  }
+
+  private handleSessionLogLine(line: string): void {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+
+    if (!isRecord(parsed) || !isRecord(parsed.payload) || typeof parsed.payload.type !== "string") {
+      return;
+    }
+
+    const payload = parsed.payload;
+    const timestamp = typeof parsed.timestamp === "string" ? parsed.timestamp : nowIso();
+
+    switch (payload.type) {
+      case "task_started": {
+        if (typeof payload.turn_id === "string") {
+          this.hasAcceptedInput = true;
+          this.state.activeTurnId = payload.turn_id;
+          if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
+            const message =
+              this.state.activeTurnOrigin === "local"
+                ? "Codex is busy with a local terminal turn."
+                : undefined;
+            this.setStatus("busy", message);
+          }
+        }
+        return;
+      }
+
+      case "user_message": {
+        if (typeof payload.message !== "string") {
+          return;
+        }
+
+        const message = normalizeOutput(payload.message).trim();
+        if (!message) {
+          return;
+        }
+
+        this.hasAcceptedInput = true;
+        this.state.lastInputAt = timestamp;
+        const origin = this.consumeInjectedInput(message) ? "wechat" : "local";
+        this.state.activeTurnOrigin = origin;
+
+        if (origin === "local") {
+          if (this.state.status !== "busy" && this.state.status !== "awaiting_approval") {
+            this.setStatus("busy", "Codex is busy with a local terminal turn.");
+          }
+          this.emit({
+            type: "mirrored_user_input",
+            text: message,
+            timestamp,
+            origin: "local",
+          });
+        }
+        return;
+      }
+
+      case "agent_message": {
+        if (payload.phase !== "final_answer" || typeof payload.message !== "string") {
+          return;
+        }
+
+        const message = normalizeOutput(payload.message).trim();
+        if (message) {
+          this.sessionFinalText = message;
+          this.state.lastOutputAt = timestamp;
+        }
+        return;
+      }
+
+      case "task_complete": {
+        if (typeof payload.turn_id !== "string") {
+          return;
+        }
+
+        if (this.hasCompletedTurn(payload.turn_id)) {
+          this.sessionFinalText = null;
+          if (this.activeTurn?.turnId === payload.turn_id) {
+            this.setActiveTurn(null);
+          }
+          if (this.state.status !== "stopped") {
+            this.setStatus("idle");
+          }
+          return;
+        }
+
+        const finalText =
+          this.sessionFinalText ||
+          (typeof payload.last_agent_message === "string"
+            ? normalizeOutput(payload.last_agent_message).trim()
+            : "");
+        const completionOrigin = this.state.activeTurnOrigin;
+        this.sessionFinalText = null;
+        this.clearPendingApprovalState();
+
+        if (finalText) {
+          this.emit({
+            type: "stdout",
+            text: finalText,
+            timestamp,
+          });
+        }
+
+        if (this.state.status !== "stopped") {
+          this.setStatus("idle");
+        }
+
+        this.emit({
+          type: "task_complete",
+          summary:
+            completionOrigin === "local"
+              ? "Local terminal turn completed."
+              : this.currentPreview,
+          timestamp,
+        });
+
+        this.rememberCompletedTurn(payload.turn_id);
+        this.state.activeTurnId = undefined;
+        this.state.activeTurnOrigin = undefined;
+        return;
+      }
+    }
+  }
+
+  private rememberInjectedInput(text: string): void {
+    const normalizedText = normalizeOutput(text).trim();
+    if (!normalizedText) {
+      return;
+    }
+
+    const cutoff = Date.now() - 60_000;
+    this.pendingInjectedInputs = this.pendingInjectedInputs.filter(
+      (entry) => entry.createdAtMs >= cutoff,
+    );
+    this.pendingInjectedInputs.push({
+      text,
+      normalizedText,
+      createdAtMs: Date.now(),
+    });
+    if (this.pendingInjectedInputs.length > 8) {
+      this.pendingInjectedInputs.splice(0, this.pendingInjectedInputs.length - 8);
+    }
+  }
+
+  private consumeInjectedInput(message: string): boolean {
+    const normalizedMessage = normalizeOutput(message).trim();
+    if (!normalizedMessage) {
+      return false;
+    }
+
+    const cutoff = Date.now() - 60_000;
+    this.pendingInjectedInputs = this.pendingInjectedInputs.filter(
+      (entry) => entry.createdAtMs >= cutoff,
+    );
+
+    const index = this.pendingInjectedInputs.findIndex(
+      (entry) => entry.normalizedText === normalizedMessage,
+    );
+    if (index < 0) {
+      return false;
+    }
+
+    this.pendingInjectedInputs.splice(index, 1);
+    return true;
+  }
+
+  private async typeIntoPty(text: string): Promise<void> {
+    for (const character of text) {
+      this.writeToPty(character);
+      await delay(4);
+    }
+  }
+
+  private async sendPanelTurn(text: string): Promise<void> {
+    if (!this.nativeProcess) {
+      throw new Error("codex panel is not running.");
+    }
+    if (this.pendingApproval) {
+      throw new Error("A Codex approval request is pending. Reply with /confirm <code> or /deny.");
+    }
+    if (this.pendingTurnStart || this.activeTurn || this.state.status === "busy") {
+      const origin = this.state.activeTurnOrigin;
+      if (origin === "local") {
+        throw new Error("The local Codex panel is still working. Wait for the current reply or use /stop.");
+      }
+      throw new Error("codex is still working. Wait for the current reply or use /stop.");
+    }
+
+    this.clearInterruptTimer();
+    this.hasAcceptedInput = true;
+    this.currentPreview = truncatePreview(text);
+    this.state.lastInputAt = nowIso();
+    this.rememberInjectedInput(text);
+    this.clearPendingApprovalState();
+
+    const threadId = await this.ensureThreadStarted();
+    this.pendingTurnStart = true;
+    this.pendingTurnThreadId = threadId;
+    this.interruptPendingTurnStart = false;
+    this.state.activeTurnOrigin = "wechat";
+    this.setStatus("busy");
+
+    try {
+      const response = await this.sendRpcRequest("turn/start", {
+        threadId,
+        cwd: this.options.cwd,
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        input: [
+          {
+            type: "text",
+            text,
+          },
+        ],
+      });
+
+      const turnId = this.extractTurnIdFromResponse(response);
+      if (!turnId) {
+        throw new Error("Codex did not return a turn id for the requested turn.");
+      }
+
+      this.bindActiveTurn({
+        threadId,
+        turnId,
+        origin: "wechat",
+      });
+
+      if (this.interruptPendingTurnStart) {
+        await this.requestActiveTurnInterrupt();
+        this.armInterruptFallback();
+      }
+    } catch (error) {
+      this.pendingTurnStart = false;
+      this.pendingTurnThreadId = null;
+      this.interruptPendingTurnStart = false;
+      this.state.activeTurnOrigin = undefined;
+      if (!this.activeTurn && this.state.status === "busy") {
+        this.setStatus("idle");
+      }
+      throw error;
+    }
+  }
+
+  private async interruptPanelTurn(): Promise<boolean> {
+    if (!this.nativeProcess) {
+      return false;
+    }
+
+    const turnPending =
+      this.pendingTurnStart || this.state.status === "busy" || this.state.status === "awaiting_approval";
+    if (!turnPending) {
+      return false;
+    }
+
+    this.clearPendingApprovalState();
+
+    if (this.pendingTurnStart && !this.activeTurn) {
+      this.interruptPendingTurnStart = true;
+      this.armInterruptFallback();
+      return true;
+    }
+
+    if (!this.activeTurn) {
+      return false;
+    }
+
+    await this.requestActiveTurnInterrupt();
+    this.armInterruptFallback();
+    return true;
   }
 
   private async startAppServer(): Promise<void> {
@@ -1292,14 +2125,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         timestamp: nowIso(),
       });
 
-      if (this.pty) {
-        this.shuttingDown = true;
-        try {
-          this.pty.kill();
-        } catch {
-          // Best effort cleanup after app-server failure.
-        }
-      }
+      this.terminateCodexClient();
     });
 
     try {
@@ -1464,14 +2290,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       timestamp: nowIso(),
     });
 
-    if (this.pty) {
-      this.shuttingDown = true;
-      try {
-        this.pty.kill();
-      } catch {
-        // Best effort cleanup after websocket failure.
-      }
-    }
+    this.terminateCodexClient();
   }
 
   private rejectPendingRpcRequests(message: string): void {
@@ -1495,8 +2314,8 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
   }
 
   private async ensureThreadStarted(): Promise<string> {
-    if (this.currentThreadId) {
-      return this.currentThreadId;
+    if (this.sharedThreadId) {
+      return this.sharedThreadId;
     }
 
     const response = await this.sendRpcRequest("thread/start", {
@@ -1514,7 +2333,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       throw new Error("Codex did not return a thread id for the bridge session.");
     }
 
-    this.currentThreadId = threadId;
+    this.setSharedThreadId(threadId);
     return threadId;
   }
 
@@ -1532,37 +2351,33 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     return typeof response.turn.id === "string" ? response.turn.id : null;
   }
 
-  private bindCurrentTurn(turnId: string): void {
+  private bindActiveTurn(activeTurn: CodexActiveTurn): void {
     this.pendingTurnStart = false;
-    this.currentTurnId = turnId;
+    this.pendingTurnThreadId = null;
+    this.bridgeOwnedTurnIds.add(activeTurn.turnId);
+    this.setActiveTurn(activeTurn);
 
     const queuedNotifications = this.queuedTurnNotifications;
     this.queuedTurnNotifications = [];
     for (const notification of queuedNotifications) {
-      const notificationTurnId = getNotificationTurnId(notification.params);
-      if (notificationTurnId === turnId) {
-        this.handleTurnScopedNotification(notification.method, notification.params);
-      }
+      this.handleRpcNotification(notification.method, notification.params);
     }
 
     const queuedRequests = this.queuedTurnServerRequests;
     this.queuedTurnServerRequests = [];
     for (const request of queuedRequests) {
-      const requestTurnId = getNotificationTurnId(request.params);
-      if (requestTurnId === turnId) {
-        this.handleTurnScopedServerRequest(request.requestId, request.method, request.params);
-      }
+      this.handleRpcServerRequest(request.requestId, request.method, request.params);
     }
   }
 
   private async requestActiveTurnInterrupt(): Promise<void> {
-    if (!this.currentThreadId || !this.currentTurnId) {
+    if (!this.activeTurn) {
       return;
     }
 
     await this.sendRpcRequest("turn/interrupt", {
-      threadId: this.currentThreadId,
-      turnId: this.currentTurnId,
+      threadId: this.activeTurn.threadId,
+      turnId: this.activeTurn.turnId,
     });
   }
 
@@ -1574,7 +2389,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         return;
       }
 
-      this.resetCurrentTurnState({ preserveThread: true });
+      this.resetTurnTracking({ preserveThread: true });
       this.setStatus("idle", "Codex task interrupted.");
       this.emit({
         type: "task_complete",
@@ -1592,33 +2407,65 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.interruptTimer = null;
   }
 
-  private resetCurrentTurnState(options: { preserveThread: boolean }): void {
+  private resetTurnTracking(options: { preserveThread: boolean }): void {
     this.clearInterruptTimer();
-    this.currentTurnId = null;
+    if (this.activeTurn) {
+      this.cleanupTurnArtifacts(this.activeTurn.turnId);
+    }
+    this.setActiveTurn(null);
     this.pendingTurnStart = false;
+    this.pendingTurnThreadId = null;
     this.interruptPendingTurnStart = false;
-    this.pendingApprovalRequest = null;
-    this.pendingApproval = null;
-    this.state.pendingApproval = null;
+    this.pendingThreadFollowId = null;
+    this.clearPendingApprovalState();
     this.queuedTurnNotifications = [];
     this.queuedTurnServerRequests = [];
-    this.currentTurnFinalMessages.clear();
-    this.currentTurnDeltaByItem.clear();
-    this.currentTurnError = null;
+    this.turnFinalMessages.clear();
+    this.turnDeltaByItem.clear();
+    this.turnErrorById.clear();
+    this.mirroredUserInputTurnIds.clear();
+    this.bridgeOwnedTurnIds.clear();
+    this.completedTurnIds.clear();
+    this.completedTurnOrder = [];
+    this.pendingInjectedInputs = [];
+    this.sessionFinalText = null;
+    this.state.activeTurnId = undefined;
+    this.state.activeTurnOrigin = undefined;
     if (!options.preserveThread) {
-      this.currentThreadId = null;
+      this.setSharedThreadId(null);
     }
   }
 
-  private currentTurnStateMatches(params: unknown): boolean {
-    const threadId = getNotificationThreadId(params);
-    const turnId = getNotificationTurnId(params);
-    return (
-      Boolean(threadId) &&
-      threadId === this.currentThreadId &&
-      Boolean(turnId) &&
-      turnId === this.currentTurnId
-    );
+  private setSharedThreadId(threadId: string | null): void {
+    this.sharedThreadId = threadId;
+    this.state.sharedThreadId = threadId ?? undefined;
+  }
+
+  private setActiveTurn(activeTurn: CodexActiveTurn | null): void {
+    this.activeTurn = activeTurn;
+    this.state.activeTurnId = activeTurn?.turnId;
+    this.state.activeTurnOrigin = activeTurn?.origin;
+    if (activeTurn) {
+      this.setSharedThreadId(activeTurn.threadId);
+    } else if (this.pendingThreadFollowId) {
+      this.setSharedThreadId(this.pendingThreadFollowId);
+      this.pendingThreadFollowId = null;
+    }
+  }
+
+  private clearPendingApprovalState(): void {
+    this.pendingApprovalRequest = null;
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+  }
+
+  private cleanupTurnArtifacts(turnId: string): void {
+    this.turnFinalMessages.delete(turnId);
+    this.turnDeltaByItem.delete(turnId);
+    this.turnErrorById.delete(turnId);
+    this.mirroredUserInputTurnIds.delete(turnId);
+    this.bridgeOwnedTurnIds.delete(turnId);
   }
 
   private rpcRequestKey(requestId: CodexRpcRequestId): string {
@@ -1731,7 +2578,13 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       return;
     }
 
+    if (method === "thread/status/changed") {
+      this.handleThreadStatusChanged(params);
+      return;
+    }
+
     if (
+      method === "item/started" ||
       method === "item/agentMessage/delta" ||
       method === "item/completed" ||
       method === "turn/completed" ||
@@ -1739,46 +2592,85 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       method === "error" ||
       method === "serverRequest/resolved"
     ) {
-      if (this.pendingTurnStart && !this.currentTurnId) {
+      if (this.shouldQueuePendingTurnEvent(params)) {
         this.queuedTurnNotifications.push({ method, params });
         return;
       }
 
-      if (!this.currentTurnStateMatches(params)) {
-        if (
-          method === "serverRequest/resolved" &&
-          this.pendingApprovalRequest &&
-          getNotificationThreadId(params) === this.currentThreadId
-        ) {
-          const requestId = getCodexRpcRequestId(params.requestId);
-          if (requestId !== null && requestId === this.pendingApprovalRequest.requestId) {
-            this.pendingApprovalRequest = null;
-            this.pendingApproval = null;
-            this.state.pendingApproval = null;
-            if (this.state.status === "awaiting_approval") {
-              this.setStatus("busy", "Codex approval resolved.");
-            }
-          }
-        }
+      const trackedTurn = this.identifyTrackedTurn(method, params);
+      if (!trackedTurn) {
         return;
       }
 
-      this.handleTurnScopedNotification(method, params);
+      this.handleTrackedTurnNotification(method, params, trackedTurn);
       return;
     }
 
-    if (this.currentTurnStateMatches(params)) {
+    if (this.activeTurn) {
       this.state.lastOutputAt = nowIso();
     }
   }
 
-  private handleTurnScopedNotification(
+  private shouldQueuePendingTurnEvent(params: Record<string, unknown>): boolean {
+    if (!this.pendingTurnStart || this.activeTurn || !this.pendingTurnThreadId) {
+      return false;
+    }
+
+    return getNotificationThreadId(params) === this.pendingTurnThreadId;
+  }
+
+  private identifyTrackedTurn(
     method: string,
     params: Record<string, unknown>,
+  ): CodexActiveTurn | null {
+    const threadId = getNotificationThreadId(params);
+    const turnId = getNotificationTurnId(params);
+    if (!threadId || !turnId) {
+      return null;
+    }
+
+    if (this.bridgeOwnedTurnIds.has(turnId)) {
+      return {
+        threadId,
+        turnId,
+        origin: "wechat",
+      };
+    }
+
+    if (this.sharedThreadId && threadId === this.sharedThreadId) {
+      return {
+        threadId,
+        turnId,
+        origin: "local",
+      };
+    }
+
+    if ((method === "turn/started" || method === "item/started") && !this.activeTurn) {
+      this.setSharedThreadId(threadId);
+      return {
+        threadId,
+        turnId,
+        origin: "local",
+      };
+    }
+
+    return null;
+  }
+
+  private handleTrackedTurnNotification(
+    method: string,
+    params: Record<string, unknown>,
+    trackedTurn: CodexActiveTurn,
   ): void {
     this.state.lastOutputAt = nowIso();
+    this.handleTrackedTurnStarted(trackedTurn);
 
     switch (method) {
+      case "item/started": {
+        this.maybeMirrorLocalUserInput(trackedTurn, params.item);
+        return;
+      }
+
       case "item/agentMessage/delta": {
         const itemId = typeof params.itemId === "string" ? params.itemId : null;
         const delta = typeof params.delta === "string" ? params.delta : "";
@@ -1786,26 +2678,28 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
           return;
         }
 
-        const previous = this.currentTurnDeltaByItem.get(itemId) ?? "";
-        this.currentTurnDeltaByItem.set(itemId, `${previous}${delta}`);
+        const deltaByItem = this.getTurnDeltaMap(trackedTurn.turnId);
+        const previous = deltaByItem.get(itemId) ?? "";
+        deltaByItem.set(itemId, `${previous}${delta}`);
         return;
       }
 
       case "item/completed": {
+        this.maybeMirrorLocalUserInput(trackedTurn, params.item);
         const itemId =
           isRecord(params.item) && typeof params.item.id === "string"
             ? params.item.id
             : null;
         const finalText = extractCodexFinalTextFromItem(params.item);
         if (itemId && finalText) {
-          this.currentTurnFinalMessages.set(itemId, finalText);
+          this.getTurnFinalMessageMap(trackedTurn.turnId).set(itemId, finalText);
         }
         return;
       }
 
       case "error": {
         if (isRecord(params.error) && typeof params.error.message === "string") {
-          this.currentTurnError = params.error.message;
+          this.turnErrorById.set(trackedTurn.turnId, params.error.message);
         }
         return;
       }
@@ -1815,11 +2709,10 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
         if (
           requestId !== null &&
           this.pendingApprovalRequest &&
-          requestId === this.pendingApprovalRequest.requestId
+          requestId === this.pendingApprovalRequest.requestId &&
+          trackedTurn.turnId === this.pendingApprovalRequest.turnId
         ) {
-          this.pendingApprovalRequest = null;
-          this.pendingApproval = null;
-          this.state.pendingApproval = null;
+          this.clearPendingApprovalState();
           if (this.state.status === "awaiting_approval") {
             this.setStatus("busy", "Codex approval resolved.");
           }
@@ -1828,7 +2721,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       }
 
       case "turn/completed": {
-        this.handleTurnCompleted(params);
+        this.handleTurnCompleted(trackedTurn, params);
         return;
       }
     }
@@ -1864,7 +2757,7 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       return;
     }
 
-    if (this.pendingTurnStart && !this.currentTurnId) {
+    if (this.shouldQueuePendingTurnEvent(params)) {
       this.queuedTurnServerRequests.push({
         requestId,
         method,
@@ -1873,17 +2766,20 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       return;
     }
 
-    if (!this.currentTurnStateMatches(params)) {
+    const trackedTurn = this.identifyTrackedTurn("server/request", params);
+    if (!trackedTurn) {
       return;
     }
 
-    this.handleTurnScopedServerRequest(requestId, method, params);
+    this.handleTrackedTurnStarted(trackedTurn);
+    this.handleTrackedTurnServerRequest(requestId, method, params, trackedTurn);
   }
 
-  private handleTurnScopedServerRequest(
+  private handleTrackedTurnServerRequest(
     requestId: CodexRpcRequestId,
     method: CodexPendingApprovalRequest["method"],
     params: Record<string, unknown>,
+    trackedTurn: CodexActiveTurn,
   ): void {
     const request = buildCodexApprovalRequest(method, params);
     if (!request) {
@@ -1893,9 +2789,13 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     this.pendingApprovalRequest = {
       requestId,
       method,
+      threadId: trackedTurn.threadId,
+      turnId: trackedTurn.turnId,
+      origin: trackedTurn.origin,
     };
     this.pendingApproval = request;
     this.state.pendingApproval = request;
+    this.state.pendingApprovalOrigin = trackedTurn.origin;
     this.state.lastOutputAt = nowIso();
     this.setStatus("awaiting_approval", "Codex approval is required.");
     this.emit({
@@ -1905,16 +2805,104 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     });
   }
 
-  private handleTurnCompleted(params: Record<string, unknown>): void {
+  private handleThreadStatusChanged(params: Record<string, unknown>): void {
+    const threadId = getNotificationThreadId(params);
+    if (!threadId) {
+      return;
+    }
+
+    const status = isRecord(params.status) ? params.status : null;
+    if (!status || status.type !== "active") {
+      return;
+    }
+
+    if (!this.activeTurn || this.activeTurn.threadId === threadId) {
+      this.setSharedThreadId(threadId);
+      this.pendingThreadFollowId = null;
+      return;
+    }
+
+    this.pendingThreadFollowId = threadId;
+  }
+
+  private handleTrackedTurnStarted(trackedTurn: CodexActiveTurn): void {
+    if (this.activeTurn?.turnId === trackedTurn.turnId) {
+      return;
+    }
+
+    if (!this.activeTurn) {
+      this.setActiveTurn(trackedTurn);
+      if (trackedTurn.origin === "local" && this.state.status !== "awaiting_approval") {
+        this.setStatus("busy", "Codex is busy with a local terminal turn.");
+      }
+      return;
+    }
+
+    if (this.activeTurn.threadId !== trackedTurn.threadId) {
+      this.pendingThreadFollowId = trackedTurn.threadId;
+    }
+  }
+
+  private maybeMirrorLocalUserInput(
+    trackedTurn: CodexActiveTurn,
+    item: unknown,
+  ): void {
+    if (trackedTurn.origin !== "local" || this.mirroredUserInputTurnIds.has(trackedTurn.turnId)) {
+      return;
+    }
+
+    const text = extractCodexUserMessageText(item);
+    if (!text) {
+      return;
+    }
+
+    this.mirroredUserInputTurnIds.add(trackedTurn.turnId);
+    this.emit({
+      type: "mirrored_user_input",
+      text,
+      timestamp: nowIso(),
+      origin: "local",
+    });
+  }
+
+  private handleTurnCompleted(
+    trackedTurn: CodexActiveTurn,
+    params: Record<string, unknown>,
+  ): void {
+    if (this.hasCompletedTurn(trackedTurn.turnId)) {
+      if (this.activeTurn?.turnId === trackedTurn.turnId) {
+        this.setActiveTurn(null);
+      }
+      this.cleanupTurnArtifacts(trackedTurn.turnId);
+      return;
+    }
+
     const turn = isRecord(params.turn) ? params.turn : null;
     const status = turn && typeof turn.status === "string" ? turn.status : "completed";
     const completedError =
       turn && isRecord(turn.error) && typeof turn.error.message === "string"
         ? turn.error.message
-        : this.currentTurnError;
-    const finalText = this.collectCurrentTurnOutput();
+        : this.turnErrorById.get(trackedTurn.turnId) ?? null;
+    const finalText = this.collectTurnOutput(trackedTurn.turnId);
+    const completedTrackedTurn =
+      this.activeTurn?.turnId === trackedTurn.turnId ? this.activeTurn : trackedTurn;
+    const summary =
+      status === "interrupted"
+        ? "Interrupted"
+        : completedTrackedTurn.origin === "local"
+          ? "Local terminal turn completed."
+          : this.currentPreview;
 
-    this.resetCurrentTurnState({ preserveThread: true });
+    if (
+      this.pendingApprovalRequest &&
+      this.pendingApprovalRequest.turnId === trackedTurn.turnId
+    ) {
+      this.clearPendingApprovalState();
+    }
+    if (this.activeTurn?.turnId === trackedTurn.turnId) {
+      this.setActiveTurn(null);
+    }
+    this.cleanupTurnArtifacts(trackedTurn.turnId);
 
     if (finalText) {
       this.emit({
@@ -1933,27 +2921,49 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       });
     }
 
-    if (this.state.status !== "stopped") {
+    if (
+      this.state.status !== "stopped" &&
+      (!this.activeTurn || this.activeTurn.turnId === trackedTurn.turnId)
+    ) {
       const statusMessage =
         status === "interrupted" ? "Codex task interrupted." : undefined;
       this.setStatus("idle", statusMessage);
     }
     this.emit({
       type: "task_complete",
-      summary: status === "interrupted" ? "Interrupted" : this.currentPreview,
+      summary,
       timestamp: nowIso(),
     });
+    this.rememberCompletedTurn(trackedTurn.turnId);
   }
 
-  private collectCurrentTurnOutput(): string | null {
-    const finalMessages = Array.from(this.currentTurnFinalMessages.values())
+  private getTurnFinalMessageMap(turnId: string): Map<string, string> {
+    let finalMessages = this.turnFinalMessages.get(turnId);
+    if (!finalMessages) {
+      finalMessages = new Map<string, string>();
+      this.turnFinalMessages.set(turnId, finalMessages);
+    }
+    return finalMessages;
+  }
+
+  private getTurnDeltaMap(turnId: string): Map<string, string> {
+    let deltaByItem = this.turnDeltaByItem.get(turnId);
+    if (!deltaByItem) {
+      deltaByItem = new Map<string, string>();
+      this.turnDeltaByItem.set(turnId, deltaByItem);
+    }
+    return deltaByItem;
+  }
+
+  private collectTurnOutput(turnId: string): string | null {
+    const finalMessages = Array.from(this.getTurnFinalMessageMap(turnId).values())
       .map((text) => normalizeOutput(text).trim())
       .filter(Boolean);
     if (finalMessages.length > 0) {
       return finalMessages.join("\n\n");
     }
 
-    const deltaFallback = Array.from(this.currentTurnDeltaByItem.values())
+    const deltaFallback = Array.from(this.getTurnDeltaMap(turnId).values())
       .map((text) => normalizeOutput(text).trim())
       .filter(Boolean);
     if (deltaFallback.length === 0) {
@@ -2003,6 +3013,27 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
     return ` Recent app-server log: ${truncatePreview(summary, 220)}`;
   }
 
+  private terminateCodexClient(): void {
+    this.shuttingDown = true;
+
+    if (this.pty) {
+      try {
+        this.pty.kill();
+      } catch {
+        // Best effort cleanup after embedded client failure.
+      }
+      return;
+    }
+
+    if (this.nativeProcess) {
+      try {
+        this.nativeProcess.kill();
+      } catch {
+        // Best effort cleanup after panel client failure.
+      }
+    }
+  }
+
   private attachLocalInputForwarding(): void {
     if (this.localInputListener || !process.stdin.readable) {
       return;
@@ -2037,6 +3068,25 @@ class CodexPtyAdapter extends AbstractPtyAdapter {
       process.stdout.write(rawText);
     } catch {
       // Best effort local mirroring for the visible Codex panel.
+    }
+  }
+
+  private hasCompletedTurn(turnId: string): boolean {
+    return this.completedTurnIds.has(turnId);
+  }
+
+  private rememberCompletedTurn(turnId: string): void {
+    if (this.completedTurnIds.has(turnId)) {
+      return;
+    }
+
+    this.completedTurnIds.add(turnId);
+    this.completedTurnOrder.push(turnId);
+    while (this.completedTurnOrder.length > CODEX_RECENT_SESSION_KEY_LIMIT) {
+      const staleTurnId = this.completedTurnOrder.shift();
+      if (staleTurnId) {
+        this.completedTurnIds.delete(staleTurnId);
+      }
     }
   }
 }
@@ -2239,7 +3289,9 @@ class ShellAdapter extends AbstractPtyAdapter {
 export function createBridgeAdapter(options: AdapterOptions): BridgeAdapter {
   switch (options.kind) {
     case "codex":
-      return new CodexPtyAdapter(options);
+      return options.renderMode === "panel"
+        ? new CodexPtyAdapter(options)
+        : new CodexPanelProxyAdapter(options);
     case "claude":
       return new CliPtyAdapter(options);
     case "shell":

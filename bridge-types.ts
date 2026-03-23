@@ -1,4 +1,5 @@
 export type BridgeAdapterKind = "codex" | "claude" | "shell";
+export type BridgeTurnOrigin = "wechat" | "local";
 
 export type BridgeWorkerStatus =
   | "starting"
@@ -47,6 +48,10 @@ export type BridgeAdapterState = {
   lastInputAt?: string;
   lastOutputAt?: string;
   pendingApproval?: ApprovalRequest | null;
+  sharedThreadId?: string;
+  activeTurnId?: string;
+  activeTurnOrigin?: BridgeTurnOrigin;
+  pendingApprovalOrigin?: BridgeTurnOrigin;
 };
 
 export type BridgeEvent =
@@ -70,6 +75,12 @@ export type BridgeEvent =
       type: "approval_required";
       request: ApprovalRequest;
       timestamp: string;
+    }
+  | {
+      type: "mirrored_user_input";
+      text: string;
+      timestamp: string;
+      origin: "local";
     }
   | {
       type: "task_complete";

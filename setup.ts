@@ -192,6 +192,7 @@ async function main() {
         console.log();
         console.log("Start the WeChat bridge with:");
         console.log("  bun run bridge:codex");
+        console.log("  bun run codex:panel   # start this in a second terminal after bridge:codex");
         console.log("  bun run bridge:claude");
         console.log("  bun run bridge:shell");
         console.log();

@@ -218,6 +218,9 @@ async function main(): Promise<void> {
       log(`Profile: ${options.profile}`);
     }
     log(`Authorized WeChat user: ${credentials.userId}`);
+    if (options.adapter === "codex") {
+      log('Start the visible Codex panel in a second terminal with: bun run codex:panel');
+    }
 
     while (true) {
       const pollResult = await transport.pollMessages({
@@ -327,6 +330,15 @@ function wireAdapterEvents(params: {
           await queueWechatMessage(
             authorizedUserId,
             formatApprovalMessage(pending, adapter.getState()),
+          );
+        });
+        break;
+      case "mirrored_user_input":
+        void outputBatcher.flushNow().then(async () => {
+          stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
+          await queueWechatMessage(
+            authorizedUserId,
+            `Local Codex input:\n${truncatePreview(event.text, 500)}`,
           );
         });
         break;
@@ -485,6 +497,14 @@ async function handleInboundMessage(params: {
 
   const adapterState = adapter.getState();
   if (adapterState.status === "busy") {
+    if (options.adapter === "codex" && adapterState.activeTurnOrigin === "local") {
+      await queueWechatMessage(
+        message.senderId,
+        "codex is currently busy with a local terminal turn. Wait for it to finish or use /stop.",
+      );
+      return null;
+    }
+
     await queueWechatMessage(
       message.senderId,
       `${options.adapter} is still working. Wait for the current reply or use /stop.`,

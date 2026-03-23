@@ -10,6 +10,7 @@
     "check": "bun wechat-channel.ts --check",
     "bridge": "node --no-warnings --experimental-strip-types wechat-bridge.ts",
     "bridge:codex": "node --no-warnings --experimental-strip-types wechat-bridge.ts --adapter codex",
+    "codex:panel": "node --no-warnings --experimental-strip-types codex-panel.ts",
     "bridge:claude": "node --no-warnings --experimental-strip-types wechat-bridge.ts --adapter claude",
     "bridge:shell": "node --no-warnings --experimental-strip-types wechat-bridge.ts --adapter shell",
     "bridge:bun": "bun wechat-bridge.ts",

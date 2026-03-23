@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildCodexApprovalRequest,
   extractCodexFinalTextFromItem,
+  extractCodexUserMessageText,
   matchesCodexSessionMeta,
   resolveSpawnTarget,
 } from "./bridge-adapters.ts";
@@ -224,7 +225,7 @@ describe("matchesCodexSessionMeta", () => {
       matchesCodexSessionMeta(
         {
           cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
-          source: "wechat_bridge",
+          source: { custom: "wechat_bridge" },
           timestamp: "2026-03-22T15:00:02.000Z",
         },
         {
@@ -243,7 +244,7 @@ describe("matchesCodexSessionMeta", () => {
       matchesCodexSessionMeta(
         {
           cwd: "C:\\Users\\unlin\\Desktop\\Github\\claude-code-wechat-channel",
-          source: "cli",
+          source: { custom: "cli" },
           timestamp: "2026-03-22T15:00:02.000Z",
         },
         {
@@ -340,5 +341,43 @@ describe("extractCodexFinalTextFromItem", () => {
         id: "cmd_1",
       }),
     ).toBeNull();
+  });
+});
+
+describe("extractCodexUserMessageText", () => {
+  test("extracts plain text user input", () => {
+    expect(
+      extractCodexUserMessageText({
+        type: "userMessage",
+        id: "msg_1",
+        content: [
+          {
+            type: "text",
+            text: "List the files in this directory.",
+            text_elements: [],
+          },
+        ],
+      }),
+    ).toBe("List the files in this directory.");
+  });
+
+  test("summarizes non-text inputs for mirrored local prompts", () => {
+    expect(
+      extractCodexUserMessageText({
+        type: "userMessage",
+        id: "msg_2",
+        content: [
+          {
+            type: "mention",
+            name: "repo",
+            path: "app://repo",
+          },
+          {
+            type: "localImage",
+            path: "C:\\repo\\diagram.png",
+          },
+        ],
+      }),
+    ).toBe("[mention: repo]\n[local image: C:\\repo\\diagram.png]");
   });
 });
