@@ -8,7 +8,12 @@ import type {
   BridgeThreadSwitchSource,
   BridgeTurnOrigin,
 } from "./bridge-types.ts";
-import { normalizeOutput, nowIso, truncatePreview } from "./bridge-utils.ts";
+import {
+  detectCliApproval,
+  normalizeOutput,
+  nowIso,
+  truncatePreview,
+} from "./bridge-utils.ts";
 import { AbstractPtyAdapter } from "./bridge-adapters.core.ts";
 import * as shared from "./bridge-adapters.shared.ts";
 
@@ -39,10 +44,12 @@ const {
   buildCodexCliArgs,
   coerceWebSocketMessageData,
   delay,
+  describeUnknownError,
   extractCodexFinalTextFromItem,
   extractCodexThreadFollowIdFromStatusChanged,
   extractCodexThreadStartedThreadId,
   extractCodexUserMessageText,
+  findCodexSessionFile,
   findRecentCodexSessionFileForCwd,
   getCodexRpcRequestId,
   getNotificationThreadId,
@@ -50,11 +57,14 @@ const {
   isRecord,
   isRecentIsoTimestamp,
   listCodexResumeSessions,
+  normalizeComparablePath,
   normalizeCodexRpcError,
+  reserveLocalPort,
   resolveSpawnTarget,
   shouldAutoCompleteCodexWechatTurnAfterFinalReply,
   shouldIgnoreCodexSessionReplayEntry,
   shouldRecoverCodexStaleBusyState,
+  waitForTcpPort,
 } = shared;
 
 export class CodexPtyAdapter extends AbstractPtyAdapter {

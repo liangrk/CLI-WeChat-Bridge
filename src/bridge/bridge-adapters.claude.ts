@@ -1,6 +1,7 @@
 ﻿import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { buildLocalCompanionToken } from "../companion/local-companion-link.ts";
 import { ensureWorkspaceChannelDir } from "../wechat/channel-config.ts";
 import {
   buildClaudeFailureMessage,
