@@ -31,6 +31,14 @@
 - Windows 为当前主要验证环境
 - [Node.js](https://nodejs.org/en/download) `>= 24.0.0`（建议直接安装官网 LTS 版本）
 - [Bun](https://bun.sh/docs/installation) `>= 1.0.0`
+
+```bash
+# Windows (PowerShell)
+powershell -c "irm bun.sh/install.ps1 | iex"
+
+# macOS / Linux
+curl -fsSL https://bun.sh/install | bash
+```
 - 已安装以下至少一种本地 CLI：
   - [`codex`](https://github.com/openai/codex)
   - [`claude`](https://code.claude.com/docs/en/overview)
