@@ -142,6 +142,12 @@ wechat-bridge-claude
 wechat-claude
 ```
 
+如需跳过权限确认（等同于 `claude --dangerously-skip-permissions`）：
+
+```bash
+wechat-claude --dangerously-skip-permissions
+```
+
 ![Claude Windows](docs/images/image-6.png)
 
 ![Claude Linux](docs/images/image-7.png)
