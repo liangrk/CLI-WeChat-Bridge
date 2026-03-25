@@ -61,6 +61,7 @@ export type AdapterOptions = {
   initialResumeConversationId?: string;
   initialTranscriptPath?: string;
   renderMode?: "embedded" | "panel" | "companion";
+  dangerouslySkipPermissions?: boolean;
 };
 
 export type EventSink = (event: BridgeEvent) => void;
@@ -316,10 +317,14 @@ export function buildClaudeCliArgs(options: {
   resumeConversationId?: string | null;
   profile?: string;
   includeNoAltScreen?: boolean;
+  dangerouslySkipPermissions?: boolean;
 }): string[] {
   const args: string[] = [];
   if (options.includeNoAltScreen) {
     args.push("--no-alt-screen");
+  }
+  if (options.dangerouslySkipPermissions) {
+    args.push("--dangerously-skip-permissions");
   }
   args.push("--settings", options.settingsFilePath);
   if (options.resumeConversationId) {

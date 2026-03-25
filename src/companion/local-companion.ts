@@ -19,11 +19,13 @@ function log(adapter: string, message: string): void {
 type LocalCompanionCliOptions = {
   adapter: "codex" | "claude";
   cwd: string;
+  dangerouslySkipPermissions?: boolean;
 };
 
 function parseCliArgs(argv: string[]): LocalCompanionCliOptions {
   let adapter: "codex" | "claude" | null = null;
   let cwd = process.cwd();
+  let dangerouslySkipPermissions = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -59,6 +61,11 @@ function parseCliArgs(argv: string[]): LocalCompanionCliOptions {
       continue;
     }
 
+    if (arg === "--dangerously-skip-permissions") {
+      dangerouslySkipPermissions = true;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
 
@@ -66,7 +73,7 @@ function parseCliArgs(argv: string[]): LocalCompanionCliOptions {
     throw new Error("Missing required --adapter <codex|claude>");
   }
 
-  return { adapter, cwd };
+  return { adapter, cwd, dangerouslySkipPermissions };
 }
 
 async function main(): Promise<void> {
@@ -101,6 +108,7 @@ async function main(): Promise<void> {
     initialResumeConversationId: endpoint.resumeConversationId,
     initialTranscriptPath: endpoint.transcriptPath,
     renderMode: endpoint.kind === "codex" ? "panel" : "companion",
+    dangerouslySkipPermissions: options.dangerouslySkipPermissions,
   });
 
   let shuttingDown = false;

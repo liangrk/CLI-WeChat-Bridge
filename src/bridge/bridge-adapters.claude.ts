@@ -225,6 +225,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       resumeConversationId: this.resumeConversationId,
       profile: this.options.profile,
       includeNoAltScreen: shouldIncludeClaudeNoAltScreen(this.options.command),
+      dangerouslySkipPermissions: this.options.dangerouslySkipPermissions,
     });
   }
 
