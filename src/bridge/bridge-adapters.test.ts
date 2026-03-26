@@ -841,6 +841,70 @@ describe("Claude CLI compatibility", () => {
 
     await adapter.dispose();
   });
+
+  test("clears busy state when a real session switch occurs (e.g. /clear)", async () => {
+    const adapter = createBridgeAdapter({
+      kind: "claude",
+      command: "claude",
+      cwd: process.cwd(),
+      renderMode: "companion",
+    }) as any;
+    const events: Array<{ type: string }> = [];
+    adapter.setEventSink((event: { type: string }) => events.push(event));
+    adapter.renderLocalOutput = () => undefined;
+    adapter.pty = {
+      pid: 1234,
+      write() {},
+      kill() {},
+    };
+
+    await adapter.sendInput("test prompt");
+    expect(adapter.state.status).toBe("busy");
+
+    adapter.handleClaudeSessionStart({
+      session_id: "new-session-abc123",
+      source: undefined,
+      transcript_path: undefined,
+    });
+
+    expect(adapter.state.status).toBe("idle");
+    const types = events.map((e) => e.type);
+    expect(types).toContain("task_complete");
+    expect(types).toContain("session_switched");
+
+    await adapter.dispose();
+  });
+
+  test("interrupt fallback timer clears busy state when Stop hook does not fire", async () => {
+    const adapter = createBridgeAdapter({
+      kind: "claude",
+      command: "claude",
+      cwd: process.cwd(),
+      renderMode: "companion",
+    }) as any;
+    const events: Array<{ type: string }> = [];
+    adapter.setEventSink((event: { type: string }) => events.push(event));
+    adapter.renderLocalOutput = () => undefined;
+    adapter.pty = {
+      pid: 1234,
+      write() {},
+      kill() {},
+    };
+
+    await adapter.sendInput("test prompt");
+    expect(adapter.state.status).toBe("busy");
+
+    const interrupted = await adapter.interrupt();
+    expect(interrupted).toBe(true);
+
+    // Wait for INTERRUPT_SETTLE_DELAY_MS (1500ms) + margin
+    await wait(1800);
+
+    expect(adapter.state.status).toBe("idle");
+    expect(events.map((e) => e.type)).toContain("task_complete");
+
+    await adapter.dispose();
+  });
 });
 
 describe("extractCodexThreadFollowIdFromStatusChanged", () => {

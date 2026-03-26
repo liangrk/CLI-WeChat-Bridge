@@ -38,6 +38,7 @@ type ClaudePendingHookApproval = shared.ClaudePendingHookApproval;
 const {
   CLAUDE_HOOK_LISTEN_HOST,
   CLAUDE_WECHAT_WORKING_NOTICE_DELAY_MS,
+  INTERRUPT_SETTLE_DELAY_MS,
   MODULE_DIR,
   buildClaudeCliArgs,
   isClaudeInvalidResumeError,
@@ -149,7 +150,9 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
+    this.clearCompletionTimer();
     this.writeToPty("\u0003");
+    this.scheduleTaskComplete(INTERRUPT_SETTLE_DELAY_MS);
     return true;
   }
 
@@ -621,6 +624,25 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       return;
     }
 
+    if (this.state.status === "busy" || this.state.status === "awaiting_approval") {
+      this.clearWechatWorkingNotice(true);
+      this.pendingCliApprovalHints = null;
+      this.flushPendingClaudeHookApprovals();
+      this.clearCompletionTimer();
+      this.pendingApproval = null;
+      this.state.pendingApproval = null;
+      this.state.pendingApprovalOrigin = undefined;
+      this.state.activeTurnOrigin = undefined;
+      this.hasAcceptedInput = false;
+      this.setStatus("idle");
+      this.emit({
+        type: "task_complete",
+        summary: this.currentPreview,
+        timestamp: nowIso(),
+      });
+      this.currentPreview = "(idle)";
+    }
+
     const timestamp = nowIso();
     const isRestore =
       !previousRuntimeSessionId &&
@@ -761,6 +783,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   }
 
   private handleClaudeStop(payload: { last_assistant_message?: string }): void {
+    this.clearCompletionTimer();
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
@@ -788,6 +811,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     error_details?: string;
     last_assistant_message?: string;
   }): void {
+    this.clearCompletionTimer();
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
