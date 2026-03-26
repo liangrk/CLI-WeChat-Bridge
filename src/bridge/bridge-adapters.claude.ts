@@ -682,6 +682,17 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.activeTurnOrigin = "local";
     this.pendingCliApprovalHints = null;
     this.clearWechatWorkingNotice(true);
+
+    if (prompt.startsWith("/")) {
+      this.emit({
+        type: "mirrored_user_input",
+        text: prompt,
+        origin: "local",
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
     this.setStatus("busy");
     this.emit({
       type: "mirrored_user_input",

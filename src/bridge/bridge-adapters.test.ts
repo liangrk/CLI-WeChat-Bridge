@@ -905,6 +905,35 @@ describe("Claude CLI compatibility", () => {
 
     await adapter.dispose();
   });
+
+  test("does not set busy for local CLI commands (e.g. /compact, /help)", async () => {
+    const adapter = createBridgeAdapter({
+      kind: "claude",
+      command: "claude",
+      cwd: process.cwd(),
+      renderMode: "companion",
+    }) as any;
+    const events: Array<{ type: string; text?: string }> = [];
+    adapter.setEventSink((event: { type: string; text?: string }) => events.push(event));
+    adapter.pty = {
+      pid: 1234,
+      write() {},
+      kill() {},
+    };
+    adapter.state.status = "idle";
+
+    adapter.handleClaudeUserPromptSubmit({ prompt: "/compact" });
+    expect(adapter.state.status).toBe("idle");
+    expect(events.some((e) => e.type === "mirrored_user_input" && e.text === "/compact")).toBe(true);
+
+    adapter.handleClaudeUserPromptSubmit({ prompt: "/help" });
+    expect(adapter.state.status).toBe("idle");
+
+    adapter.handleClaudeUserPromptSubmit({ prompt: "/model opus" });
+    expect(adapter.state.status).toBe("idle");
+
+    await adapter.dispose();
+  });
 });
 
 describe("extractCodexThreadFollowIdFromStatusChanged", () => {
