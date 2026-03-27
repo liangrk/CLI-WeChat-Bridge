@@ -788,6 +788,34 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   ): void {
     this.clearWechatWorkingNotice();
     this.flushPendingClaudeHookApprovals();
+
+    const toolName =
+      typeof payload.tool_name === "string" ? payload.tool_name.trim() : "";
+
+    // ExitPlanMode has a known bug where hook "allow" doesn't exit plan mode
+    // (https://github.com/anthropics/claude-code/issues/15755). Skip the hook
+    // and let Claude Code's native terminal handle the approval via PTY.
+    if (toolName === "ExitPlanMode") {
+      this.respondToClaudeHook(socket, requestId, undefined);
+      const request = buildClaudePermissionApprovalRequest(payload);
+      this.pendingApproval = {
+        ...request,
+        requestId: undefined,
+        confirmInput: this.pendingCliApprovalHints?.confirmInput ?? "\r",
+        denyInput: this.pendingCliApprovalHints?.denyInput ?? "n\r",
+      };
+      this.pendingCliApprovalHints = null;
+      this.state.pendingApproval = this.pendingApproval;
+      this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
+      this.setStatus("awaiting_approval", "Claude plan approval is required.");
+      this.emit({
+        type: "approval_required",
+        request: this.pendingApproval,
+        timestamp: nowIso(),
+      });
+      return;
+    }
+
     this.pendingHookApprovals.set(requestId, {
       requestId,
       socket,
