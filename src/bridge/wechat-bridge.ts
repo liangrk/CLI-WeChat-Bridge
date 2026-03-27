@@ -31,6 +31,7 @@ import {
 } from "./bridge-utils.ts";
 import {
   DEFAULT_LONG_POLL_TIMEOUT_MS,
+  WeChatSessionExpiredError,
   WeChatTransport,
   type InboundWechatMessage,
 } from "../wechat/wechat-transport.ts";
@@ -247,10 +248,19 @@ async function main(): Promise<void> {
     }
 
     while (true) {
-      const pollResult = await transport.pollMessages({
-        timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
-        minCreatedAtMs: stateStore.getState().bridgeStartedAtMs - MESSAGE_START_GRACE_MS,
-      });
+      let pollResult;
+      try {
+        pollResult = await transport.pollMessages({
+          timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
+          minCreatedAtMs: stateStore.getState().bridgeStartedAtMs - MESSAGE_START_GRACE_MS,
+        });
+      } catch (err) {
+        if (err instanceof WeChatSessionExpiredError) {
+          logError(err.message);
+          break;
+        }
+        throw err;
+      }
 
       if (pollResult.ignoredBacklogCount > 0) {
         stateStore.incrementIgnoredBacklog(pollResult.ignoredBacklogCount);

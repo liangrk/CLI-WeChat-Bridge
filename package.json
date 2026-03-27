@@ -10,7 +10,8 @@
     "wechat-codex": "./bin/wechat-codex.mjs",
     "wechat-claude": "./bin/wechat-claude.mjs",
     "wechat-bridge-claude": "./bin/wechat-bridge-claude.mjs",
-    "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs"
+    "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs",
+    "wechat-claude-go": "./bin/wechat-claude-go.mjs"
   },
   "scripts": {
     "setup": "bun src/wechat/setup.ts",

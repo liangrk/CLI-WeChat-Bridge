@@ -9,6 +9,15 @@ import {
   SYNC_BUF_FILE,
 } from "./channel-config.ts";
 
+export class WeChatSessionExpiredError extends Error {
+  constructor() {
+    super(
+      'WeChat session has expired (errcode=-14). Please re-run "bun run setup" to re-authenticate.',
+    );
+    this.name = "WeChatSessionExpiredError";
+  }
+}
+
 export const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MSG_TYPE_USER = 1;
 const MSG_TYPE_BOT = 2;
@@ -264,6 +273,9 @@ export class WeChatTransport {
       (response.errcode !== undefined && response.errcode !== 0);
 
     if (isError) {
+      if (response.errcode === -14) {
+        throw new WeChatSessionExpiredError();
+      }
       throw new Error(
         `getUpdates failed: ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`,
       );

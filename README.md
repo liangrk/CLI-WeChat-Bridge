@@ -47,7 +47,7 @@ curl -fsSL https://bun.sh/install | bash
 ### 1. 克隆仓库并安装依赖
 
 ```bash
-git clone https://github.com/UNLINEARITY/CLI-WeChat-Bridge
+git clone https://github.com/liangrk/CLI-WeChat-Bridge
 cd CLI-WeChat-Bridge
 bun install
 ```
@@ -156,6 +156,20 @@ wechat-claude
 wechat-claude --dangerously-skip-permissions
 ```
 
+#### 一键启动（推荐）
+
+也可以使用 `wechat-claude-go` 一条命令完成上述两步——自动在新窗口启动 bridge 监听，当前窗口直接进入 Claude 工作区：
+
+```bash
+wechat-claude-go
+```
+
+如需跳过权限确认：
+
+```bash
+wechat-claude-go --dangerously-skip-permissions
+```
+
 ![Claude Windows](docs/images/image-6.png)
 
 ![Claude Linux](docs/images/image-7.png)
@@ -178,6 +192,7 @@ wechat-bridge-codex
 wechat-codex
 wechat-bridge-claude
 wechat-claude
+wechat-claude-go
 wechat-bridge-shell
 ```
 
