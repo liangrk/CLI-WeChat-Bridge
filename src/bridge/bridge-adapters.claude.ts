@@ -66,6 +66,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private workingNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   private workingNoticeSent = false;
   private workingNoticeDelayMs = CLAUDE_WECHAT_WORKING_NOTICE_DELAY_MS;
+  private pendingInputQueue: string[] = [];
+  private queuedInputCount = 0;
 
   constructor(options: AdapterOptions) {
     super(options);
@@ -102,11 +104,16 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     if (!this.pty) {
       throw new Error("claude adapter is not running.");
     }
-    if (this.state.status === "busy") {
-      throw new Error("claude is still working. Wait for the current reply or use /stop.");
-    }
+
     if (this.pendingApproval) {
-      throw new Error("A Claude approval request is pending. Reply with /confirm <code> or /deny.");
+      this.pendingInputQueue.push(text);
+      this.queuedInputCount++;
+      return;
+    }
+
+    const isBusy = this.state.status === "busy";
+    if (isBusy) {
+      this.queuedInputCount++;
     }
 
     const normalizedText = normalizeOutput(text).trim();
@@ -120,9 +127,40 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.lastInputAt = nowIso();
     this.state.activeTurnOrigin = "wechat";
     this.pendingCliApprovalHints = null;
+    if (!isBusy) {
+      this.clearWechatWorkingNotice(true);
+      this.setStatus("busy");
+    }
+    this.writeToPty(text.replace(/\r?\n/g, "\r"));
+    this.writeToPty("\r");
+    if (!isBusy) {
+      this.armWechatWorkingNotice();
+    }
+  }
+
+  getQueueInfo(): { queuedCount: number; pendingQueueLength: number } {
+    return { queuedCount: this.queuedInputCount, pendingQueueLength: this.pendingInputQueue.length };
+  }
+
+  private flushPendingInputQueue(): void {
+    if (this.pendingInputQueue.length === 0) {
+      return;
+    }
+    const nextInput = this.pendingInputQueue.shift()!;
+    const normalizedText = normalizeOutput(nextInput).trim();
+    this.pendingInjectedInputs.push({
+      normalizedText,
+      createdAtMs: Date.now(),
+    });
+    this.pendingInjectedInputs = this.pendingInjectedInputs.slice(-8);
+    this.hasAcceptedInput = true;
+    this.currentPreview = truncatePreview(nextInput);
+    this.state.lastInputAt = nowIso();
+    this.state.activeTurnOrigin = "wechat";
+    this.pendingCliApprovalHints = null;
     this.clearWechatWorkingNotice(true);
     this.setStatus("busy");
-    this.writeToPty(text.replace(/\r?\n/g, "\r"));
+    this.writeToPty(nextInput.replace(/\r?\n/g, "\r"));
     this.writeToPty("\r");
     this.armWechatWorkingNotice();
   }
@@ -151,6 +189,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
     this.clearCompletionTimer();
+    this.pendingInputQueue = [];
+    this.queuedInputCount = 0;
     this.writeToPty("\u0003");
     this.scheduleTaskComplete(INTERRUPT_SETTLE_DELAY_MS);
     return true;
@@ -159,6 +199,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   override async reset(): Promise<void> {
     this.clearWechatWorkingNotice(true);
     this.pendingCliApprovalHints = null;
+    this.pendingInputQueue = [];
+    this.queuedInputCount = 0;
     this.runtimeSessionId = null;
     this.resumeConversationId = null;
     this.transcriptPath = null;
@@ -634,6 +676,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       this.state.pendingApprovalOrigin = undefined;
       this.state.activeTurnOrigin = undefined;
       this.hasAcceptedInput = false;
+      this.pendingInputQueue = [];
+      this.queuedInputCount = 0;
       this.setStatus("idle");
       this.emit({
         type: "task_complete",
@@ -803,6 +847,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.pendingApprovalOrigin = undefined;
     this.state.activeTurnOrigin = undefined;
     this.hasAcceptedInput = false;
+    this.queuedInputCount = 0;
     this.setStatus("idle");
     this.emit({
       type: "final_reply",
@@ -815,6 +860,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       timestamp: nowIso(),
     });
     this.currentPreview = "(idle)";
+    this.flushPendingInputQueue();
   }
 
   private handleClaudeStopFailure(payload: {
@@ -831,6 +877,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.pendingApprovalOrigin = undefined;
     this.state.activeTurnOrigin = undefined;
     this.hasAcceptedInput = false;
+    this.queuedInputCount = 0;
     this.setStatus("idle");
     this.emit({
       type: "task_failed",
@@ -838,6 +885,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       timestamp: nowIso(),
     });
     this.currentPreview = "(idle)";
+    this.flushPendingInputQueue();
   }
 
   private respondToClaudeHook(

@@ -639,7 +639,7 @@ async function handleInboundMessage(params: {
   }
 
   const adapterState = adapter.getState();
-  if (adapterState.status === "busy") {
+  if (adapterState.status === "busy" || adapterState.status === "awaiting_approval") {
     if (options.adapter === "codex" && adapterState.activeTurnOrigin === "local") {
       await queueWechatMessage(
         message.senderId,
@@ -648,11 +648,34 @@ async function handleInboundMessage(params: {
       return null;
     }
 
-    await queueWechatMessage(
-      message.senderId,
-      `${options.adapter} is still working. Wait for the current reply or use /stop.`,
-    );
-    return null;
+    try {
+      await adapter.sendInput(message.text);
+      const queueInfo = ("getQueueInfo" in adapter && typeof adapter.getQueueInfo === "function")
+        ? (adapter as { getQueueInfo(): { queuedCount: number; pendingQueueLength: number } }).getQueueInfo()
+        : null;
+      const queuedCount = queueInfo?.queuedCount ?? 0;
+      const isApprovalQueue = queueInfo?.pendingQueueLength != null && queueInfo.pendingQueueLength > 0;
+      if (isApprovalQueue) {
+        await queueWechatMessage(
+          message.senderId,
+          queuedCount > 0
+            ? `Message queued (position ${queuedCount}). Will be sent after approval is resolved.`
+            : "Message queued. Will be sent after approval is resolved.",
+        );
+      } else {
+        await queueWechatMessage(
+          message.senderId,
+          "Message queued.",
+        );
+      }
+      return null;
+    } catch {
+      await queueWechatMessage(
+        message.senderId,
+        `${options.adapter} is still working. Wait for the current reply or use /stop.`,
+      );
+      return null;
+    }
   }
 
   const activeTask = {
