@@ -22,7 +22,28 @@ export type SystemCommand =
   | { type: "stop" }
   | { type: "reset" }
   | { type: "confirm"; code?: string }
-  | { type: "deny" };
+  | { type: "deny" }
+  | { type: "projects" }
+  | { type: "project_add"; name: string; cwd: string; adapter?: BridgeAdapterKind }
+  | { type: "project_remove"; name: string }
+  | { type: "project_status"; name: string }
+  | { type: "project_stop"; name: string }
+  | { type: "project_start"; name: string };
+
+export type ProjectMessage = {
+  projectId: string;
+  command: SystemCommand | null;
+  text: string;
+};
+
+export function parseProjectPrefix(text: string): ProjectMessage | null {
+  const match = text.trim().match(/^@([a-zA-Z0-9_-]+)\s*(.*)/s);
+  if (!match) return null;
+  const projectId = match[1];
+  const remaining = match[2].trim();
+  const command = parseSystemCommand(remaining);
+  return { projectId, command, text: remaining };
+}
 
 export const MESSAGE_START_GRACE_MS = 5_000;
 
@@ -104,9 +125,58 @@ export function parseSystemCommand(text: string): SystemCommand | null {
       return argument ? { type: "confirm", code: argument } : null;
     case "/deny":
       return { type: "deny" };
+    case "/projects":
+      return { type: "projects" };
     default:
-      return null;
+      break;
   }
+
+  // Multi-project management commands: /project <subcommand> <args>
+  if (command === "/project") {
+    const parts = argument.split(/\s+/);
+    const subcommand = parts[0]?.toLowerCase();
+    switch (subcommand) {
+      case "add": {
+        // /project add <name> <cwd> [--adapter <kind>]
+        const name = parts[1];
+        const cwd = parts[2];
+        if (!name || !cwd) return null;
+        let adapter: BridgeAdapterKind | undefined;
+        const adapterIdx = parts.indexOf("--adapter");
+        if (adapterIdx !== -1 && parts[adapterIdx + 1]) {
+          const val = parts[adapterIdx + 1];
+          if (val === "codex" || val === "claude" || val === "shell") {
+            adapter = val;
+          }
+        }
+        return { type: "project_add", name, cwd, adapter };
+      }
+      case "remove": {
+        const name = parts[1];
+        if (!name) return null;
+        return { type: "project_remove", name };
+      }
+      case "status": {
+        const name = parts[1];
+        if (!name) return null;
+        return { type: "project_status", name };
+      }
+      case "stop": {
+        const name = parts[1];
+        if (!name) return null;
+        return { type: "project_stop", name };
+      }
+      case "start": {
+        const name = parts[1];
+        if (!name) return null;
+        return { type: "project_start", name };
+      }
+      default:
+        return null;
+    }
+  }
+
+  return null;
 }
 
 export function parseWechatControlCommand(

@@ -68,6 +68,9 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private workingNoticeDelayMs = CLAUDE_WECHAT_WORKING_NOTICE_DELAY_MS;
   private pendingInputQueue: string[] = [];
   private queuedInputCount = 0;
+  private contextCaptureTimer: ReturnType<typeof setTimeout> | null = null;
+  private contextCapturing = false;
+  private contextBuffer = "";
 
   constructor(options: AdapterOptions) {
     super(options);
@@ -103,6 +106,11 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   override async sendInput(text: string): Promise<void> {
     if (!this.pty) {
       throw new Error("claude adapter is not running.");
+    }
+
+    // User input takes priority over context capture
+    if (this.contextCapturing) {
+      this.clearContextCapture();
     }
 
     if (this.pendingApproval) {
@@ -165,6 +173,50 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.armWechatWorkingNotice();
   }
 
+  private scheduleContextCapture(): void {
+    this.clearContextCapture();
+    if (!this.pty) return;
+
+    // Wait for Claude to be fully idle before sending /context
+    this.contextCaptureTimer = setTimeout(() => {
+      if (!this.pty || this.state.status !== "idle") return;
+      this.contextCapturing = true;
+      this.contextBuffer = "";
+      this.writeToPty("/context\r");
+
+      // Set a timeout to finish capturing even if we don't detect the prompt
+      this.contextCaptureTimer = setTimeout(() => {
+        this.finishContextCapture();
+      }, 3_000);
+    }, 1_000);
+  }
+
+  private clearContextCapture(): void {
+    if (this.contextCaptureTimer) {
+      clearTimeout(this.contextCaptureTimer);
+      this.contextCaptureTimer = null;
+    }
+    this.contextCapturing = false;
+    this.contextBuffer = "";
+  }
+
+  private finishContextCapture(): void {
+    if (!this.contextCapturing) return;
+    const text = this.contextBuffer.trim();
+    this.contextCapturing = false;
+    this.contextBuffer = "";
+    this.contextCaptureTimer = null;
+
+    if (text) {
+      this.emit({
+        type: "notice",
+        text: `Context usage:\n${text}`,
+        level: "info",
+        timestamp: nowIso(),
+      });
+    }
+  }
+
   override async listResumeSessions(_limit = 10): Promise<BridgeResumeSessionCandidate[]> {
     throw new Error(
       'WeChat /resume is disabled in claude mode. Use /resume directly inside "wechat-claude"; WeChat will follow the active local session.',
@@ -189,6 +241,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
     this.clearCompletionTimer();
+    this.clearContextCapture();
     this.pendingInputQueue = [];
     this.queuedInputCount = 0;
     this.writeToPty("\u0003");
@@ -254,6 +307,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   override async dispose(): Promise<void> {
     this.detachLocalTerminal();
     this.clearWechatWorkingNotice(true);
+    this.clearContextCapture();
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
     await super.dispose();
@@ -294,6 +348,16 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       isClaudeInvalidResumeError(text)
     ) {
       void this.recoverFromInvalidResume(this.resumeConversationId);
+      return;
+    }
+
+    // Capture /context output
+    if (this.contextCapturing) {
+      this.contextBuffer += text;
+      // Detect prompt return (Claude shows a prompt indicator after /context)
+      if (text.includes(">") || text.includes("?") || this.contextBuffer.length > 2000) {
+        this.finishContextCapture();
+      }
       return;
     }
 
@@ -889,6 +953,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     });
     this.currentPreview = "(idle)";
     this.flushPendingInputQueue();
+    this.scheduleContextCapture();
   }
 
   private handleClaudeStopFailure(payload: {

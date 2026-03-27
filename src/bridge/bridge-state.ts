@@ -4,6 +4,7 @@ import {
   BRIDGE_LOCK_FILE,
   BRIDGE_LOG_FILE,
   BRIDGE_STATE_FILE,
+  getWorkspaceLockFilePath,
   ensureWorkspaceChannelDir,
   ensureChannelDataDir,
 } from "../wechat/channel-config.ts";
@@ -20,6 +21,7 @@ type BridgeStateOptions = {
   cwd: string;
   profile?: string;
   authorizedUserId: string;
+  lockFilePath?: string;
 };
 
 type BridgeLockPayload = {
@@ -49,12 +51,16 @@ function isPidAlive(pid: number): boolean {
 }
 
 function readLockFile(): BridgeLockPayload | null {
+  return readLockFileFrom(BRIDGE_LOCK_FILE);
+}
+
+function readLockFileFrom(filePath: string): BridgeLockPayload | null {
   try {
-    if (!fs.existsSync(BRIDGE_LOCK_FILE)) {
+    if (!fs.existsSync(filePath)) {
       return null;
     }
     return JSON.parse(
-      fs.readFileSync(BRIDGE_LOCK_FILE, "utf-8"),
+      fs.readFileSync(filePath, "utf-8"),
     ) as BridgeLockPayload;
   } catch {
     return null;
@@ -67,10 +73,12 @@ export class BridgeStateStore {
   private readonly bridgeStartedAtMs: number;
   private readonly instanceId: string;
   private readonly stateFilePath: string;
+  private readonly lockFilePath: string;
 
   constructor(options: BridgeStateOptions) {
     ensureChannelDataDir();
     this.stateFilePath = ensureWorkspaceChannelDir(options.cwd).stateFile;
+    this.lockFilePath = options.lockFilePath ?? BRIDGE_LOCK_FILE;
     this.bridgeStartedAtMs = Date.now();
     this.instanceId = buildInstanceId();
     this.lockPayload = {
@@ -210,9 +218,9 @@ export class BridgeStateStore {
 
   releaseLock(): void {
     try {
-      const currentLock = readLockFile();
+      const currentLock = readLockFileFrom(this.lockFilePath);
       if (currentLock?.pid === process.pid) {
-        fs.rmSync(BRIDGE_LOCK_FILE, { force: true });
+        fs.rmSync(this.lockFilePath, { force: true });
       }
     } catch {
       // Best effort cleanup.
@@ -225,7 +233,7 @@ export class BridgeStateStore {
   }
 
   private acquireLock(): void {
-    const existing = readLockFile();
+    const existing = readLockFileFrom(this.lockFilePath);
     if (
       existing &&
       existing.pid !== process.pid &&
@@ -240,7 +248,7 @@ export class BridgeStateStore {
     }
 
     fs.writeFileSync(
-      BRIDGE_LOCK_FILE,
+      this.lockFilePath,
       JSON.stringify(this.lockPayload, null, 2),
       "utf-8",
     );

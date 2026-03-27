@@ -29,6 +29,7 @@ export const CODEX_PANEL_ENDPOINT_FILE = path.join(
   "codex-panel-endpoint.json",
 );
 export const WORKSPACES_DIR = path.join(CHANNEL_DATA_DIR, "workspaces");
+export const PROJECTS_REGISTRY_FILE = path.join(CHANNEL_DATA_DIR, "projects-registry.json");
 
 export type WorkspaceChannelPaths = {
   workspaceDir: string;
@@ -85,6 +86,11 @@ export function getWorkspaceChannelPaths(cwd: string): WorkspaceChannelPaths {
     stateFile: path.join(workspaceDir, "bridge-state.json"),
     endpointFile: path.join(workspaceDir, "codex-panel-endpoint.json"),
   };
+}
+
+export function getWorkspaceLockFilePath(cwd: string): string {
+  const { workspaceDir } = getWorkspaceChannelPaths(cwd);
+  return path.join(workspaceDir, "bridge.lock.json");
 }
 
 export function ensureWorkspaceChannelDir(cwd: string): WorkspaceChannelPaths {

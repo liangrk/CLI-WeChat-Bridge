@@ -174,6 +174,52 @@ wechat-claude-go --dangerously-skip-permissions
 
 ![Claude Linux](docs/images/image-7.png)
 
+### 6. 启动多项目监听模式（实验性）
+
+一个微信 bot 同时监听多个项目，每个项目拥有独立的 Claude Code 实例和终端窗口，支持并行执行指令。
+
+```bash
+wechat-bridge-multi --project api-server=D:\work\api-server --project frontend=D:\work\frontend
+```
+
+启动后：
+- 每个项目会自动打开一个独立的 companion 终端窗口
+- 微信消息通过 `@<项目ID>` 前缀路由到对应项目
+
+#### 微信侧消息格式
+
+| 格式 | 说明 |
+| --- | --- |
+| `@api-server fix the login bug` | 向 `api-server` 项目发送指令 |
+| `@frontend /status` | 查询 `frontend` 项目状态 |
+| `/status` | 查看路由器全局状态（所有项目概览） |
+| `/projects` | 列出所有已注册项目及其状态 |
+| `@api-server /stop` | 中断 `api-server` 的当前任务 |
+| `@api-server /reset` | 重置 `api-server` 的工作会话 |
+
+#### 每条指令完成后自动透传上下文占用信息
+
+在 `claude` 适配器下，每次指令执行完成后，会自动向微信发送 `/context` 的上下文占用信息（token 使用量），格式如：
+
+```
+[api-server] Context usage:
+Token usage: 45230/200000 (22.6%)
+...
+```
+
+#### 仓库内开发入口
+
+```bash
+bun run bridge:multi -- --project api-server=D:\work\api --project frontend=D:\work\web
+```
+
+#### 注意事项
+
+- 多项目模式是实验性功能，原有单项目模式（`wechat-bridge-claude` 等）完全不受影响
+- 每个项目独立工作目录、独立 Claude Code 会话、独立状态文件
+- 所有项目共享同一个微信 Transport，消息通过项目 ID 前缀路由
+- 建议项目数量不超过 5 个，避免资源占用过高
+
 ## 适配器支持情况
 
 | 适配器 | 当前状态 | 说明 |
@@ -194,6 +240,7 @@ wechat-bridge-claude
 wechat-claude
 wechat-claude-go
 wechat-bridge-shell
+wechat-bridge-multi
 ```
 
 ### 仓库内开发入口
@@ -205,6 +252,7 @@ bun run codex:panel
 bun run bridge:claude
 bun run claude:companion
 bun run bridge:shell
+bun run bridge:multi -- --project api-server=D:\work\api --project frontend=D:\work\web
 bun run bridge:bun -- --adapter codex
 bun run test
 ```
@@ -235,7 +283,14 @@ wechat-bridge-shell --cmd pwsh.exe
 
 | 指令 | 说明 |
 | --- | --- |
+| 指令 | 说明 |
+| --- | --- |
 | 普通文本 | 发送给当前活动会话 |
+| `@<项目ID> <消息>` | 多项目模式下，向指定项目发送消息 |
+| `/status` | 查看 bridge 当前状态 |
+| `/stop` | 中断当前任务 |
+| `/reset` | 重建当前本地会话 |
+| `/projects` | 多项目模式下列出所有项目 |
 | `/status` | 查看 bridge 当前状态 |
 | `/stop` | 中断当前任务 |
 | `/reset` | 重建当前本地会话 |
@@ -358,8 +413,9 @@ npm install -g .
 - `codex` 是当前优先支持的路径
 - `claude code` 当前已切到 companion + hooks 路径
 - `codex` 模式下微信 `/resume` 被禁用
-- 当前模型是单 owner、单 bridge、单活动工作区
+- 当前模型是单 owner、单 bridge、单活动工作区（多项目模式为实验性扩展）
 - `claude code` 远程审批链路现已可用；微信侧可直接确认或拒绝 Claude 的权限请求
+- 多项目模式（`wechat-bridge-multi`）为实验性功能，自动 companion 窗口目前仅支持 Windows
 
 
 ## 开发说明
@@ -369,6 +425,10 @@ npm install -g .
 | 文件 | 作用 |
 | --- | --- |
 | `src/bridge/wechat-bridge.ts` | bridge 主事件循环 |
+| `src/bridge/project-router.ts` | 多项目路由器（实验性） |
+| `src/bridge/project-bridge.ts` | 单项目 Bridge 封装（多项目模式） |
+| `src/bridge/project-registry.ts` | 项目注册表持久化 |
+| `src/bridge/companion-spawner.ts` | Companion 终端窗口自动管理 |
 | `src/bridge/bridge-adapters.ts` | `codex` / `claude` / `shell` 适配器实现 |
 | `src/companion/local-companion.ts` | `wechat-codex` / `wechat-claude` 本地 companion 入口 |
 | `src/companion/codex-panel.ts` | Codex panel 入口（备用） |

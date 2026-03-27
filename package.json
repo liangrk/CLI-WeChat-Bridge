@@ -11,7 +11,8 @@
     "wechat-claude": "./bin/wechat-claude.mjs",
     "wechat-bridge-claude": "./bin/wechat-bridge-claude.mjs",
     "wechat-bridge-shell": "./bin/wechat-bridge-shell.mjs",
-    "wechat-claude-go": "./bin/wechat-claude-go.mjs"
+    "wechat-claude-go": "./bin/wechat-claude-go.mjs",
+    "wechat-bridge-multi": "./bin/wechat-bridge-multi.mjs"
   },
   "scripts": {
     "setup": "bun src/wechat/setup.ts",
@@ -23,6 +24,7 @@
     "claude:companion": "node --no-warnings --experimental-strip-types src/companion/local-companion.ts --adapter claude",
     "bridge:claude": "node --no-warnings --experimental-strip-types src/bridge/wechat-bridge.ts --adapter claude",
     "bridge:shell": "node --no-warnings --experimental-strip-types src/bridge/wechat-bridge.ts --adapter shell",
+    "bridge:multi": "node --no-warnings --experimental-strip-types src/bridge/project-router.ts",
     "bridge:bun": "bun src/bridge/wechat-bridge.ts",
     "test": "bun test"
   },
