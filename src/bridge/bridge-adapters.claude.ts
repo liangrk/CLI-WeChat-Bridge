@@ -234,12 +234,9 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     }
 
     const input =
-      action === "confirm" ? this.pendingApproval.confirmInput : this.pendingApproval.denyInput;
-    if (!input) {
-      throw new Error(
-        "Remote approval is not safely available for this Claude prompt. Approve it in the local Claude terminal.",
-      );
-    }
+      action === "confirm"
+        ? this.pendingApproval.confirmInput ?? "\r"
+        : this.pendingApproval.denyInput ?? "n\r";
 
     this.clearWechatWorkingNotice();
     this.pendingCliApprovalHints = null;
@@ -801,8 +798,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       this.pendingApproval = {
         ...request,
         requestId: undefined,
-        confirmInput: this.pendingCliApprovalHints?.confirmInput ?? "\r",
-        denyInput: this.pendingCliApprovalHints?.denyInput ?? "n\r",
+        confirmInput: this.pendingCliApprovalHints?.confirmInput ?? undefined,
+        denyInput: this.pendingCliApprovalHints?.denyInput ?? undefined,
       };
       this.pendingCliApprovalHints = null;
       this.state.pendingApproval = this.pendingApproval;
