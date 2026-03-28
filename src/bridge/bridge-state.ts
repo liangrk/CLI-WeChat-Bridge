@@ -35,7 +35,7 @@ function cloneState(state: BridgeState): BridgeState {
   return JSON.parse(JSON.stringify(state)) as BridgeState;
 }
 
-function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
     return false;
   }

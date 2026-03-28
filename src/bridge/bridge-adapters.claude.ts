@@ -31,6 +31,7 @@ import {
 } from "./bridge-utils.ts";
 import { AbstractPtyAdapter } from "./bridge-adapters.core.ts";
 import * as shared from "./bridge-adapters.shared.ts";
+import { isPidAlive } from "./bridge-state.ts";
 
 type AdapterOptions = shared.AdapterOptions;
 type ClaudePendingHookApproval = shared.ClaudePendingHookApproval;
@@ -47,8 +48,7 @@ const {
   shouldIncludeClaudeNoAltScreen,
 } = shared;
 
-const CLAUDE_STALE_BUSY_CHECK_MS = 30_000;
-const CLAUDE_STALE_BUSY_ACTIVITY_GRACE_MS = 15_000;
+const CLAUDE_STALE_BUSY_CHECK_MS = 60_000;
 
 export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private hookServer: net.Server | null = null;
@@ -78,6 +78,9 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private ptyApprovalRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly PTY_APPROVAL_MAX_RETRIES = 3;
   private static readonly PTY_APPROVAL_RETRY_DELAY_MS = 1_500;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly HEARTBEAT_INTERVAL_MS = 60_000;
+  private recoveringFromProcessDeath = false;
 
   constructor(options: AdapterOptions) {
     super(options);
@@ -212,6 +215,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
 
   override async reset(): Promise<void> {
     this.clearWechatWorkingNotice(true);
+    this.clearHeartbeat();
     this.clearStaleBusyWatchdog();
     this.pendingCliApprovalHints = null;
     this.pendingInputQueue = [];
@@ -266,6 +270,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   override async dispose(): Promise<void> {
     this.detachLocalTerminal();
     this.clearWechatWorkingNotice(true);
+    this.clearHeartbeat();
     this.clearStaleBusyWatchdog();
     this.clearPtyApprovalRetry();
     this.pendingCliApprovalHints = null;
@@ -291,6 +296,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   protected override afterStart(): void {
     this.attachLocalTerminal();
     this.resizePtyToTerminal();
+    this.armHeartbeat();
   }
 
   protected override handleData(rawText: string): void {
@@ -345,7 +351,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       timestamp: nowIso(),
     });
 
-    if (this.state.status === "busy") {
+    if (this.state.status === "busy" || this.state.status === "awaiting_approval") {
       this.armStaleBusyWatchdog();
     }
   }
@@ -353,10 +359,12 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   protected override handleExit(exitCode: number | undefined): void {
     this.detachLocalTerminal();
     this.clearWechatWorkingNotice(true);
+    this.clearHeartbeat();
     this.pendingCliApprovalHints = null;
     void this.stopHookServer();
     if (this.recoveringInvalidResume && !this.shuttingDown) {
       this.clearCompletionTimer();
+      this.clearStaleBusyWatchdog();
       this.pty = null;
       this.state.status = "stopped";
       this.state.pid = undefined;
@@ -364,7 +372,12 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       this.state.pendingApproval = null;
       return;
     }
+    if (this.recoveringFromProcessDeath || this.shuttingDown) {
+      super.handleExit(exitCode);
+      return;
+    }
     super.handleExit(exitCode);
+    void this.handleClaudeProcessDeath();
   }
 
   private async startHookServer(): Promise<void> {
@@ -375,6 +388,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.hookToken = buildLocalCompanionToken();
     await new Promise<void>((resolve, reject) => {
       const server = net.createServer((socket) => {
+        socket.setKeepAlive(true, 30_000);
         let buffer = "";
         socket.setEncoding("utf8");
         socket.on("data", (chunk) => {
@@ -628,7 +642,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private armStaleBusyWatchdog(): void {
     this.clearStaleBusyWatchdog();
     if (
-      this.state.status !== "busy" ||
+      (this.state.status !== "busy" && this.state.status !== "awaiting_approval") ||
       this.state.activeTurnOrigin !== "wechat"
     ) {
       return;
@@ -636,25 +650,29 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
 
     this.staleBusyTimer = setTimeout(() => {
       this.staleBusyTimer = null;
+
+      // Status changed away from busy/awaiting_approval — stop monitoring.
       if (
-        this.state.status !== "busy" ||
-        this.state.activeTurnOrigin !== "wechat" ||
-        this.pendingApproval
+        (this.state.status !== "busy" && this.state.status !== "awaiting_approval") ||
+        this.state.activeTurnOrigin !== "wechat"
       ) {
         return;
       }
 
-      const now = Date.now();
-      const hasRecentHookActivity =
-        this.lastHookActivityAt > 0 && now - this.lastHookActivityAt < CLAUDE_STALE_BUSY_ACTIVITY_GRACE_MS;
-      const hasRecentPtyOutput =
-        this.lastPtyOutputAt > 0 && now - this.lastPtyOutputAt < CLAUDE_STALE_BUSY_ACTIVITY_GRACE_MS;
-
-      if (hasRecentHookActivity || hasRecentPtyOutput) {
+      // Pending approval — always wait, never recover destructively.
+      if (this.pendingApproval) {
         this.armStaleBusyWatchdog();
         return;
       }
 
+      // Process still alive — just slow, re-arm instead of recovering.
+      const pid = this.state.pid;
+      if (pid && this.pty && isPidAlive(pid)) {
+        this.armStaleBusyWatchdog();
+        return;
+      }
+
+      // Process is dead — trigger recovery.
       this.recoverFromStaleBusyState();
     }, CLAUDE_STALE_BUSY_CHECK_MS);
     this.staleBusyTimer.unref?.();
@@ -692,6 +710,106 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       summary: "(stale busy recovery)",
       timestamp: nowIso(),
     });
+  }
+
+  // --- Heartbeat & Auto-Reconnect ---
+
+  private armHeartbeat(): void {
+    this.clearHeartbeat();
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      this.checkClaudeProcessHealth();
+    }, ClaudeCompanionAdapter.HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private checkClaudeProcessHealth(): void {
+    const pid = this.state.pid;
+    if (!pid || !this.pty) {
+      return;
+    }
+
+    if (isPidAlive(pid)) {
+      // Process still alive — re-arm heartbeat
+      this.armHeartbeat();
+      return;
+    }
+
+    // Process is dead — trigger auto-reconnect
+    if (this.state.status === "busy" || this.state.status === "awaiting_approval") {
+      this.clearStaleBusyWatchdog();
+      void this.handleClaudeProcessDeath();
+    }
+  }
+
+  private async handleClaudeProcessDeath(): Promise<void> {
+    if (this.recoveringFromProcessDeath || this.shuttingDown) {
+      return;
+    }
+    this.recoveringFromProcessDeath = true;
+
+    this.clearHeartbeat();
+    this.clearStaleBusyWatchdog();
+    this.clearCompletionTimer();
+    this.clearWechatWorkingNotice(true);
+    this.pendingCliApprovalHints = null;
+    this.pendingInputQueue = [];
+    this.queuedInputCount = 0;
+    this.flushPendingClaudeHookApprovals();
+
+    const hadPendingApproval = Boolean(this.pendingApproval);
+    this.pendingApproval = null;
+    this.state.pendingApproval = null;
+    this.state.pendingApprovalOrigin = undefined;
+
+    this.emit({
+      type: "notice",
+      text: "Claude process died unexpectedly. Attempting to restart and resume session...",
+      level: "warning",
+      timestamp: nowIso(),
+    });
+
+    try {
+      // Save resume state before dispose clears it
+      const savedResumeId = this.resumeConversationId;
+      const savedTranscriptPath = this.transcriptPath;
+
+      // dispose() kills the old PTY process
+      await this.dispose();
+
+      // Restore resume state so the new process can continue the session
+      this.resumeConversationId = savedResumeId;
+      this.transcriptPath = savedTranscriptPath;
+      this.state.resumeConversationId = savedResumeId ?? undefined;
+      this.state.transcriptPath = savedTranscriptPath ?? undefined;
+
+      // start() spawns a new Claude Code process with --resume
+      await this.start();
+
+      this.emit({
+        type: "notice",
+        text: hadPendingApproval
+          ? "Claude restarted with session resumed. The previous approval was lost — Claude may re-request it."
+          : "Claude restarted with session resumed.",
+        level: "info",
+        timestamp: nowIso(),
+      });
+    } catch (err) {
+      this.emit({
+        type: "fatal_error",
+        message: `Failed to restart Claude: ${String(err)}`,
+        timestamp: nowIso(),
+      });
+    } finally {
+      this.recoveringFromProcessDeath = false;
+    }
   }
 
   /**
@@ -948,6 +1066,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       this.state.pendingApproval = this.pendingApproval;
       this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
       this.setStatus("awaiting_approval", "Claude plan approval is required.");
+      this.armStaleBusyWatchdog();
       this.emit({
         type: "approval_required",
         request: this.pendingApproval,
@@ -972,6 +1091,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.state.pendingApproval = this.pendingApproval;
     this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
     this.setStatus("awaiting_approval", "Claude approval is required.");
+    this.armStaleBusyWatchdog();
     this.emit({
       type: "approval_required",
       request: this.pendingApproval,
