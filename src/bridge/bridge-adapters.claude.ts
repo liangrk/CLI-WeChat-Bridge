@@ -327,10 +327,23 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         };
         this.state.pendingApproval = this.pendingApproval;
       } else {
-        this.pendingCliApprovalHints = {
+        // No pending hook-based approval yet — this is a pure CLI-detected
+        // approval (e.g. when PermissionRequest hook is missing).  Emit an
+        // approval_required event so WeChat gets notified immediately.
+        this.pendingApproval = {
+          ...approval,
           confirmInput: approval.confirmInput,
           denyInput: approval.denyInput,
         };
+        this.state.pendingApproval = this.pendingApproval;
+        this.state.pendingApprovalOrigin = this.state.activeTurnOrigin;
+        this.setStatus("awaiting_approval", "Claude approval is required.");
+        this.armStaleBusyWatchdog();
+        this.emit({
+          type: "approval_required",
+          request: this.pendingApproval,
+          timestamp: nowIso(),
+        });
       }
       return;
     }
@@ -338,15 +351,6 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     if (!this.hasAcceptedInput) {
       return;
     }
-
-    // Emit stdout for WeChat delivery as a streaming backup alongside
-    // the structured Stop hook's final_reply. The OutputBatcher handles
-    // deduplication and chunking.
-    this.emit({
-      type: "stdout",
-      text,
-      timestamp: nowIso(),
-    });
 
     if (this.state.status === "busy" || this.state.status === "awaiting_approval") {
       this.armStaleBusyWatchdog();
@@ -863,6 +867,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       return;
     }
 
+    process.stderr.write(`[claude-adapter] hook event: ${payload.hook_event_name}\n`);
+
     switch (payload.hook_event_name) {
       case "SessionStart":
         this.handleClaudeSessionStart(payload);
@@ -1053,6 +1059,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     const toolName =
       typeof payload.tool_name === "string" ? payload.tool_name.trim() : "";
 
+    process.stderr.write(`[claude-adapter] permission request: tool=${toolName || "unknown"} requestId=${requestId}\n`);
+
     // ExitPlanMode has a known bug where hook "allow" doesn't exit plan mode
     // (https://github.com/anthropics/claude-code/issues/15755). Skip the hook
     // and let Claude Code's native terminal handle the approval via PTY.
@@ -1122,6 +1130,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   }
 
   private handleClaudeStop(payload: { last_assistant_message?: string }): void {
+    const msgLen = String(payload.last_assistant_message ?? "").length;
+    process.stderr.write(`[claude-adapter] stop hook: last_assistant_message length=${msgLen}\n`);
     this.clearStaleBusyWatchdog();
     this.clearCompletionTimer();
     this.clearPtyApprovalRetry();
@@ -1154,6 +1164,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     error_details?: string;
     last_assistant_message?: string;
   }): void {
+    process.stderr.write(`[claude-adapter] stop failure: ${payload.error ?? "unknown"}\n`);
     this.clearStaleBusyWatchdog();
     this.clearCompletionTimer();
     this.clearPtyApprovalRetry();

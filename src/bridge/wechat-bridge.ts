@@ -168,29 +168,39 @@ async function main(): Promise<void> {
     initialTranscriptPath: stateStore.getState().transcriptPath,
   });
   let sendChain = Promise.resolve();
+  let replySendChain = Promise.resolve();
   let activeTask: ActiveTask | null = null;
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
 
-  const queueWechatMessage = (senderId: string, text: string) => {
-    sendChain = sendChain.then(async () => {
-      const maxRetries = 3;
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-          await transport.sendText(senderId, text);
-          return;
-        } catch (err) {
-          const errorText = err instanceof Error ? err.message : String(err);
-          if (attempt < maxRetries) {
-            logError(`WeChat send failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying: ${errorText}`);
-            await new Promise((resolve) => setTimeout(resolve, 2_000));
-          } else {
-            logError(`Failed to send WeChat reply after ${maxRetries + 1} attempts: ${errorText}`);
-          }
+  const sendWithRetry = async (senderId: string, text: string, channel?: string) => {
+    const maxRetries = 3;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        await transport.sendText(senderId, text);
+        if (channel) log(`${channel} message sent: ${truncatePreview(text, 80)}`);
+        return;
+      } catch (err) {
+        const errorText = err instanceof Error ? err.message : String(err);
+        if (attempt < maxRetries) {
+          logError(`WeChat send failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying: ${errorText}`);
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+        } else {
+          logError(`Failed to send WeChat reply after ${maxRetries + 1} attempts: ${errorText}`);
         }
       }
-    });
+    }
+  };
+
+  const queueWechatMessage = (senderId: string, text: string) => {
+    sendChain = sendChain.then(() => sendWithRetry(senderId, text, "sendChain"));
     return sendChain;
+  };
+
+  // Channel B: independent send chain for final replies, not blocked by Channel A.
+  const queueReplyMessage = (senderId: string, text: string) => {
+    replySendChain = replySendChain.then(() => sendWithRetry(senderId, text, "reply"));
+    return replySendChain;
   };
 
   const outputBatcher = new OutputBatcher(
@@ -236,6 +246,7 @@ async function main(): Promise<void> {
       stateStore,
       outputBatcher,
       queueWechatMessage,
+      queueReplyMessage,
       getActiveTask: () => activeTask,
       clearActiveTask: () => {
         activeTask = null;
@@ -397,6 +408,7 @@ function wireAdapterEvents(params: {
   stateStore: BridgeStateStore;
   outputBatcher: OutputBatcher;
   queueWechatMessage: (senderId: string, text: string) => Promise<void>;
+  queueReplyMessage: (senderId: string, text: string) => Promise<void>;
   getActiveTask: () => ActiveTask | null;
   clearActiveTask: () => void;
   updateLastOutputAt: () => void;
@@ -408,6 +420,7 @@ function wireAdapterEvents(params: {
     stateStore,
     outputBatcher,
     queueWechatMessage,
+    queueReplyMessage,
     getActiveTask,
     clearActiveTask,
     updateLastOutputAt,
@@ -419,13 +432,16 @@ function wireAdapterEvents(params: {
     const adapterState = adapter.getState();
     const authorizedUserId = stateStore.getState().authorizedUserId;
 
-    const flushAndSend = async (text: string) => {
+    const flushAndSend = async (text: string, label?: string) => {
+      const tag = label ? `[${label}] ` : "";
+      log(`${tag}flushAndSend: text length: ${text.length}`);
       try {
         await outputBatcher.flushNow();
       } catch (err) {
-        logError(`flushAndSend: flush failed: ${String(err)}`);
+        logError(`${tag}flushAndSend: flush failed: ${String(err)}`);
       }
       await queueWechatMessage(authorizedUserId, text);
+      log(`${tag}flushAndSend: queued to sendChain`);
     };
 
     switch (event.type) {
@@ -435,7 +451,8 @@ function wireAdapterEvents(params: {
         outputBatcher.push(event.text);
         break;
       case "final_reply":
-        void flushAndSend(formatFinalReplyMessage(options.adapter, event.text));
+        log(`event: final_reply, text length: ${event.text.length}`);
+        void queueReplyMessage(authorizedUserId, formatFinalReplyMessage(options.adapter, event.text));
         break;
       case "status":
         if (event.message) {
@@ -445,10 +462,12 @@ function wireAdapterEvents(params: {
         break;
       case "notice":
         updateLastOutputAt();
+        log(`event: notice (${event.level}): ${truncatePreview(event.text, 80)}`);
         stateStore.appendLog(`${event.level}_notice: ${truncatePreview(event.text)}`);
-        void flushAndSend(event.text);
+        void flushAndSend(event.text, "notice");
         break;
       case "approval_required": {
+        log(`event: approval_required, tool: ${event.request.toolName ?? "unknown"}, source: ${event.request.source}`);
         const pending: PendingApproval = {
           ...event.request,
           code: buildOneTimeCode(),
@@ -458,12 +477,12 @@ function wireAdapterEvents(params: {
         stateStore.appendLog(
           `Approval requested (${pending.source}): ${pending.commandPreview}`,
         );
-        void flushAndSend(formatApprovalMessage(pending, adapterState));
+        void flushAndSend(formatApprovalMessage(pending, adapterState), "approval");
         break;
       }
       case "mirrored_user_input":
         stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
-        void flushAndSend(formatMirroredUserInputMessage(options.adapter, event.text));
+        void flushAndSend(formatMirroredUserInputMessage(options.adapter, event.text), "mirror");
         break;
       case "session_switched":
         stateStore.appendLog(
@@ -476,6 +495,7 @@ function wireAdapterEvents(params: {
             source: event.source,
             reason: event.reason,
           }),
+          "session",
         );
         break;
       case "thread_switched":
@@ -489,11 +509,13 @@ function wireAdapterEvents(params: {
             source: event.source,
             reason: event.reason,
           }),
+          "thread",
         );
         break;
       case "task_complete":
         stateStore.clearPendingConfirmation();
         clearActiveTask();
+        log(`event: task_complete`);
         if (options.adapter === "shell") {
           const summary = buildCompletionSummary({
             adapter: options.adapter,
@@ -501,7 +523,7 @@ function wireAdapterEvents(params: {
             exitCode: event.exitCode,
             recentOutput: outputBatcher.getRecentSummary(),
           });
-          void flushAndSend(summary);
+          void flushAndSend(summary, "complete");
         } else {
           void outputBatcher.flushNow().catch(() => {});
         }
@@ -509,7 +531,8 @@ function wireAdapterEvents(params: {
       case "task_failed":
         stateStore.clearPendingConfirmation();
         clearActiveTask();
-        void flushAndSend(formatTaskFailedMessage(options.adapter, event.message));
+        log(`event: task_failed: ${truncatePreview(event.message, 80)}`);
+        void flushAndSend(formatTaskFailedMessage(options.adapter, event.message), "failed");
         break;
       case "fatal_error":
         logError(event.message);

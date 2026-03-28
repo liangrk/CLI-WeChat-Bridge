@@ -611,14 +611,13 @@ describe("Claude CLI compatibility", () => {
 
     adapter.handleData("Thinking...\r\nReviewing files...\r\n");
 
-    // Normal output now emits stdout events (structured hook handling
-    expect(events.filter((e) => e.type === "stdout")).toHaveLength(1);
-    expect(events.filter((e) => e.type === "stdout")[0].text).toContain("Thinking");
+    // Raw PTY output is not emitted to WeChat (only final_reply is used)
+    expect(events.filter((e) => e.type === "stdout")).toHaveLength(0);
 
     adapter.handleData("Do you want to allow this? (y/n)\r\n");
 
-    // Approval prompt detection should still suppress stdout ( prevent noise)
-    expect(events.filter((e) => e.type === "stdout")).toHaveLength(1);
+    // Approval prompt detection should still suppress stdout (prevent noise)
+    expect(events.filter((e) => e.type === "stdout")).toHaveLength(0);
 
     adapter.handleClaudePermissionRequest(
       "request-123",
@@ -634,7 +633,11 @@ describe("Claude CLI compatibility", () => {
       } as any,
     );
 
-    expect(events.map((event) => event.type)).toEqual(["stdout", "status", "approval_required"]);
+    // CLI detection fires first (no hook yet), then the hook overwrites with richer data.
+    expect(events.map((event) => event.type)).toEqual([
+      "status", "approval_required", "status", "approval_required",
+    ]);
+    // The hook-based approval takes precedence
     expect(adapter.pendingApproval).toMatchObject({
       summary: "Claude permission is required for Bash.",
       commandPreview: "Bash: dir",
@@ -810,7 +813,8 @@ describe("Claude CLI compatibility", () => {
     await wait(35);
 
     expect(events.filter((event) => event.type === "notice")).toHaveLength(0);
-    expect(events.filter((event) => event.type === "approval_required")).toHaveLength(1);
+    // CLI detection emits first, then the hook overwrites with richer data
+    expect(events.filter((event) => event.type === "approval_required")).toHaveLength(2);
 
     adapter.flushPendingClaudeHookApprovals();
     await adapter.dispose();
