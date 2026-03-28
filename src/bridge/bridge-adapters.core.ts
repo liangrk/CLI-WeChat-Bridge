@@ -393,6 +393,7 @@ export abstract class AbstractPtyAdapter implements BridgeAdapter {
   protected shuttingDown = false;
   protected currentPreview = "(idle)";
   protected pendingApproval: ApprovalRequest | null = null;
+  protected ptyGeneration = 0;
 
   constructor(options: AdapterOptions) {
     this.options = options;
@@ -437,8 +438,12 @@ export abstract class AbstractPtyAdapter implements BridgeAdapter {
       this.state.status = "idle";
       this.state.pendingApproval = null;
 
+      const generation = ++this.ptyGeneration;
       ptyProcess.onData((data) => this.handleData(data));
-      ptyProcess.onExit(({ exitCode }) => this.handleExit(exitCode));
+      ptyProcess.onExit(({ exitCode }) => {
+        if (generation !== this.ptyGeneration) return;
+        this.handleExit(exitCode);
+      });
 
       this.afterStart();
       this.setStatus("idle", `${this.options.kind} adapter is ready.`);

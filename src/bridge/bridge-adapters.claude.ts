@@ -72,8 +72,6 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private pendingInputQueue: string[] = [];
   private queuedInputCount = 0;
   private staleBusyTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastHookActivityAt = 0;
-  private lastPtyOutputAt = 0;
   private ptyApprovalRetryCount = 0;
   private ptyApprovalRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly PTY_APPROVAL_MAX_RETRIES = 3;
@@ -318,7 +316,6 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     }
 
     this.state.lastOutputAt = nowIso();
-    this.lastPtyOutputAt = Date.now();
     const approval = detectCliApproval(text);
     if (approval) {
       this.clearWechatWorkingNotice();
@@ -376,8 +373,15 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       super.handleExit(exitCode);
       return;
     }
-    super.handleExit(exitCode);
-    void this.handleClaudeProcessDeath();
+
+    // Only attempt auto-recovery when Claude was actively working (busy or awaiting_approval).
+    // Skip super.handleExit() to avoid emitting fatal_error before recovery.
+    const wasActive = this.state.status === "busy" || this.state.status === "awaiting_approval";
+    if (wasActive) {
+      void this.handleClaudeProcessDeath();
+    } else {
+      super.handleExit(exitCode);
+    }
   }
 
   private async startHookServer(): Promise<void> {
@@ -853,7 +857,6 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     rawPayload: string;
     socket: net.Socket;
   }): void {
-    this.lastHookActivityAt = Date.now();
     const payload = parseClaudeHookPayload(params.rawPayload);
     if (!payload?.hook_event_name) {
       this.respondToClaudeHook(params.socket, params.requestId);
