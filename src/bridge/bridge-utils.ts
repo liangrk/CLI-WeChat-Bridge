@@ -510,6 +510,7 @@ export class OutputBatcher {
   private readonly onFlush: (text: string) => Promise<void> | void;
   private readonly flushIntervalMs: number;
   private readonly maxChars: number;
+  private readonly onError?: (error: unknown, text: string) => void;
   private buffer = "";
   private recentText = "";
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -519,10 +520,12 @@ export class OutputBatcher {
     onFlush: (text: string) => Promise<void> | void,
     flushIntervalMs = 1_000,
     maxChars = 1_200,
+    onError?: (error: unknown, text: string) => void,
   ) {
     this.onFlush = onFlush;
     this.flushIntervalMs = flushIntervalMs;
     this.maxChars = maxChars;
+    this.onError = onError;
   }
 
   push(text: string): void {
@@ -592,7 +595,11 @@ export class OutputBatcher {
 
     this.flushChain = this.flushChain
       .then(() => Promise.resolve(this.onFlush(payload)))
-      .catch(() => undefined);
+      .catch((err) => {
+        if (this.onError) {
+          this.onError(err, payload);
+        }
+      });
   }
 }
 

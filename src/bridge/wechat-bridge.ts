@@ -36,6 +36,10 @@ import {
   type InboundWechatMessage,
 } from "../wechat/wechat-transport.ts";
 
+const POLL_RETRY_DELAY_MS = 2_000;
+const POLL_RETRY_JITTER_MS = 1_000;
+const POLL_MAX_CONSECUTIVE_FAILURES = 5;
+
 type BridgeCliOptions = {
   adapter: BridgeAdapterKind;
   command: string;
@@ -169,17 +173,37 @@ async function main(): Promise<void> {
   let lastHeartbeatAt = 0;
 
   const queueWechatMessage = (senderId: string, text: string) => {
-    sendChain = sendChain
-      .then(() => transport.sendText(senderId, text))
-      .catch((err) => {
-        logError(`Failed to send WeChat reply: ${String(err)}`);
-      });
+    sendChain = sendChain.then(async () => {
+      const maxRetries = 3;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          await transport.sendText(senderId, text);
+          return;
+        } catch (err) {
+          const errorText = err instanceof Error ? err.message : String(err);
+          if (attempt < maxRetries) {
+            logError(`WeChat send failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying: ${errorText}`);
+            await new Promise((resolve) => setTimeout(resolve, 2_000));
+          } else {
+            logError(`Failed to send WeChat reply after ${maxRetries + 1} attempts: ${errorText}`);
+          }
+        }
+      }
+    });
     return sendChain;
   };
 
-  const outputBatcher = new OutputBatcher(async (text) => {
-    await queueWechatMessage(stateStore.getState().authorizedUserId, text);
-  });
+  const outputBatcher = new OutputBatcher(
+    async (text) => {
+      await queueWechatMessage(stateStore.getState().authorizedUserId, text);
+    },
+    1_000,
+    1_200,
+    (err, text) => {
+      logError(`OutputBatcher flush failed, re-enqueuing: ${String(err)}`);
+      void queueWechatMessage(stateStore.getState().authorizedUserId, text);
+    },
+  );
 
   const cleanup = async () => {
     try {
@@ -247,6 +271,8 @@ async function main(): Promise<void> {
       );
     }
 
+    let consecutivePollFailures = 0;
+
     while (true) {
       let pollResult;
       try {
@@ -254,12 +280,28 @@ async function main(): Promise<void> {
           timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
           minCreatedAtMs: stateStore.getState().bridgeStartedAtMs - MESSAGE_START_GRACE_MS,
         });
+        consecutivePollFailures = 0;
       } catch (err) {
         if (err instanceof WeChatSessionExpiredError) {
           logError(err.message);
           break;
         }
-        throw err;
+
+        consecutivePollFailures++;
+        const errorText = err instanceof Error ? err.message : String(err);
+        logError(`Poll error (attempt ${consecutivePollFailures}): ${errorText}`);
+        stateStore.appendLog(`poll_error: attempt=${consecutivePollFailures} error=${errorText}`);
+
+        if (consecutivePollFailures === POLL_MAX_CONSECUTIVE_FAILURES) {
+          await queueWechatMessage(
+            stateStore.getState().authorizedUserId,
+            `Bridge is experiencing persistent connection errors (${consecutivePollFailures} failures). Will keep retrying. Use /status to check.`,
+          );
+        }
+
+        const jitter = Math.floor(Math.random() * POLL_RETRY_JITTER_MS);
+        await new Promise((resolve) => setTimeout(resolve, POLL_RETRY_DELAY_MS + jitter));
+        continue;
       }
 
       if (pollResult.ignoredBacklogCount > 0) {
@@ -375,11 +417,16 @@ function wireAdapterEvents(params: {
   adapter.setEventSink((event) => {
     syncSharedSessionState();
     const adapterState = adapter.getState();
-    const bridgeState = stateStore.getState();
-    if (bridgeState.pendingConfirmation && !adapterState.pendingApproval) {
-      stateStore.clearPendingConfirmation();
-    }
     const authorizedUserId = stateStore.getState().authorizedUserId;
+
+    const flushAndSend = async (text: string) => {
+      try {
+        await outputBatcher.flushNow();
+      } catch (err) {
+        logError(`flushAndSend: flush failed: ${String(err)}`);
+      }
+      await queueWechatMessage(authorizedUserId, text);
+    };
 
     switch (event.type) {
       case "stdout":
@@ -388,12 +435,7 @@ function wireAdapterEvents(params: {
         outputBatcher.push(event.text);
         break;
       case "final_reply":
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(
-            authorizedUserId,
-            formatFinalReplyMessage(options.adapter, event.text),
-          );
-        });
+        void flushAndSend(formatFinalReplyMessage(options.adapter, event.text));
         break;
       case "status":
         if (event.message) {
@@ -404,92 +446,70 @@ function wireAdapterEvents(params: {
       case "notice":
         updateLastOutputAt();
         stateStore.appendLog(`${event.level}_notice: ${truncatePreview(event.text)}`);
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(authorizedUserId, event.text);
-        });
+        void flushAndSend(event.text);
         break;
-      case "approval_required":
-        void outputBatcher.flushNow().then(async () => {
-          const pending: PendingApproval = {
-            ...event.request,
-            code: buildOneTimeCode(),
-            createdAt: nowIso(),
-          };
-          stateStore.setPendingConfirmation(pending);
-          stateStore.appendLog(
-            `Approval requested (${pending.source}): ${pending.commandPreview}`,
-          );
-          await queueWechatMessage(
-            authorizedUserId,
-            formatApprovalMessage(pending, adapterState),
-          );
-        });
+      case "approval_required": {
+        const pending: PendingApproval = {
+          ...event.request,
+          code: buildOneTimeCode(),
+          createdAt: nowIso(),
+        };
+        stateStore.setPendingConfirmation(pending);
+        stateStore.appendLog(
+          `Approval requested (${pending.source}): ${pending.commandPreview}`,
+        );
+        void flushAndSend(formatApprovalMessage(pending, adapterState));
         break;
+      }
       case "mirrored_user_input":
-        void outputBatcher.flushNow().then(async () => {
-          stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
-          await queueWechatMessage(
-            authorizedUserId,
-            formatMirroredUserInputMessage(options.adapter, event.text),
-          );
-        });
+        stateStore.appendLog(`mirrored_local_input: ${truncatePreview(event.text)}`);
+        void flushAndSend(formatMirroredUserInputMessage(options.adapter, event.text));
         break;
       case "session_switched":
         stateStore.appendLog(
           `session_switched: ${event.sessionId} source=${event.source} reason=${event.reason}`,
         );
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(
-            authorizedUserId,
-            formatSessionSwitchMessage({
-              adapter: options.adapter,
-              sessionId: event.sessionId,
-              source: event.source,
-              reason: event.reason,
-            }),
-          );
-        });
+        void flushAndSend(
+          formatSessionSwitchMessage({
+            adapter: options.adapter,
+            sessionId: event.sessionId,
+            source: event.source,
+            reason: event.reason,
+          }),
+        );
         break;
       case "thread_switched":
         stateStore.appendLog(
           `thread_switched: ${event.threadId} source=${event.source} reason=${event.reason}`,
         );
-        void outputBatcher.flushNow().then(async () => {
-          await queueWechatMessage(
-            authorizedUserId,
-            formatSessionSwitchMessage({
-              adapter: options.adapter,
-              sessionId: event.threadId,
-              source: event.source,
-              reason: event.reason,
-            }),
-          );
-        });
+        void flushAndSend(
+          formatSessionSwitchMessage({
+            adapter: options.adapter,
+            sessionId: event.threadId,
+            source: event.source,
+            reason: event.reason,
+          }),
+        );
         break;
       case "task_complete":
-        void outputBatcher.flushNow().then(async () => {
-          stateStore.clearPendingConfirmation();
-          if (options.adapter === "shell") {
-            const summary = buildCompletionSummary({
-              adapter: options.adapter,
-              activeTask: getActiveTask(),
-              exitCode: event.exitCode,
-              recentOutput: outputBatcher.getRecentSummary(),
-            });
-            await queueWechatMessage(authorizedUserId, summary);
-          }
-          clearActiveTask();
-        });
+        stateStore.clearPendingConfirmation();
+        clearActiveTask();
+        if (options.adapter === "shell") {
+          const summary = buildCompletionSummary({
+            adapter: options.adapter,
+            activeTask: getActiveTask(),
+            exitCode: event.exitCode,
+            recentOutput: outputBatcher.getRecentSummary(),
+          });
+          void flushAndSend(summary);
+        } else {
+          void outputBatcher.flushNow().catch(() => {});
+        }
         break;
       case "task_failed":
-        void outputBatcher.flushNow().then(async () => {
-          stateStore.clearPendingConfirmation();
-          clearActiveTask();
-          await queueWechatMessage(
-            authorizedUserId,
-            formatTaskFailedMessage(options.adapter, event.message),
-          );
-        });
+        stateStore.clearPendingConfirmation();
+        clearActiveTask();
+        void flushAndSend(formatTaskFailedMessage(options.adapter, event.message));
         break;
       case "fatal_error":
         logError(event.message);

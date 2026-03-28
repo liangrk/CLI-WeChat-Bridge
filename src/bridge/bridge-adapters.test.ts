@@ -611,11 +611,14 @@ describe("Claude CLI compatibility", () => {
 
     adapter.handleData("Thinking...\r\nReviewing files...\r\n");
 
-    expect(events).toEqual([]);
+    // Normal output now emits stdout events (structured hook handling
+    expect(events.filter((e) => e.type === "stdout")).toHaveLength(1);
+    expect(events.filter((e) => e.type === "stdout")[0].text).toContain("Thinking");
 
     adapter.handleData("Do you want to allow this? (y/n)\r\n");
 
-    expect(events).toEqual([]);
+    // Approval prompt detection should still suppress stdout ( prevent noise)
+    expect(events.filter((e) => e.type === "stdout")).toHaveLength(1);
 
     adapter.handleClaudePermissionRequest(
       "request-123",
@@ -631,7 +634,7 @@ describe("Claude CLI compatibility", () => {
       } as any,
     );
 
-    expect(events.map((event) => event.type)).toEqual(["status", "approval_required"]);
+    expect(events.map((event) => event.type)).toEqual(["stdout", "status", "approval_required"]);
     expect(adapter.pendingApproval).toMatchObject({
       summary: "Claude permission is required for Bash.",
       commandPreview: "Bash: dir",
@@ -692,7 +695,7 @@ describe("Claude CLI compatibility", () => {
     });
   });
 
-  test("clears stale Claude remote approvals when the hook request is lost without a terminal fallback", () => {
+  test("preserves Claude remote approvals with PTY fallback when the hook request is lost", () => {
     const adapter = createBridgeAdapter({
       kind: "claude",
       command: "claude",
@@ -724,8 +727,11 @@ describe("Claude CLI compatibility", () => {
 
     adapter.handleClosedClaudeHookApproval("request-lost");
 
-    expect(adapter.pendingApproval).toBeNull();
-    expect(adapter.getState().pendingApproval).toBeNull();
+    expect(adapter.pendingApproval).not.toBeNull();
+    expect(adapter.pendingApproval.requestId).toBeUndefined();
+    expect(adapter.pendingApproval.confirmInput).toBe("y\r");
+    expect(adapter.pendingApproval.denyInput).toBe("n\r");
+    expect(adapter.getState().pendingApproval).not.toBeNull();
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "notice",

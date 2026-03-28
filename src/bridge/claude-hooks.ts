@@ -88,7 +88,10 @@ export function extractClaudeResumeConversationId(
   return conversationId || null;
 }
 
-export function buildClaudeHookSettings(command: string): Record<string, unknown> {
+export function buildClaudeHookSettings(
+  command: string,
+  options?: { skipPermissionHooks?: boolean },
+): Record<string, unknown> {
   const hook = {
     hooks: [
       {
@@ -98,21 +101,25 @@ export function buildClaudeHookSettings(command: string): Record<string, unknown
     ],
   };
 
-  return {
-    hooks: {
-      SessionStart: [hook],
-      UserPromptSubmit: [hook],
-      PermissionRequest: [hook],
-      Notification: [
-        {
-          matcher: "permission_prompt",
-          hooks: hook.hooks,
-        },
-      ],
-      Stop: [hook],
-      StopFailure: [hook],
-    },
+  const hooks: Record<string, unknown> = {
+    SessionStart: [hook],
+    UserPromptSubmit: [hook],
   };
+
+  if (!options?.skipPermissionHooks) {
+    hooks.PermissionRequest = [hook];
+    hooks.Notification = [
+      {
+        matcher: "permission_prompt",
+        hooks: hook.hooks,
+      },
+    ];
+  }
+
+  hooks.Stop = [hook];
+  hooks.StopFailure = [hook];
+
+  return { hooks };
 }
 
 export function buildClaudeHookScript(params: ClaudeHookScriptParams): string {
@@ -161,6 +168,32 @@ function summarizeClaudePlan(plan: string): string {
   return truncatePreview([heading, description].filter(Boolean).join(" - ") || lines[0], 180);
 }
 
+function formatAskUserQuestions(questions: unknown[]): string {
+  const parts: string[] = [];
+  for (const q of questions) {
+    if (typeof q !== "object" || q === null) continue;
+    const question = q as Record<string, unknown>;
+    if (typeof question.question === "string") {
+      parts.push(question.question);
+    }
+    if (Array.isArray(question.options)) {
+      for (let i = 0; i < question.options.length; i++) {
+        const opt = question.options[i];
+        if (typeof opt !== "object" || opt === null) continue;
+        const o = opt as Record<string, unknown>;
+        const label = typeof o.label === "string" ? o.label : `Option ${i + 1}`;
+        const desc = typeof o.description === "string" ? o.description : "";
+        parts.push(`${i + 1}. ${label}${desc ? ` - ${desc}` : ""}`);
+      }
+    }
+  }
+  const result = parts.join("\n");
+  if (result.length > 2000) {
+    return result.slice(0, 1997) + "...";
+  }
+  return result;
+}
+
 function summarizeClaudeToolInput(
   toolName: string,
   toolInput: Record<string, unknown> | undefined,
@@ -179,6 +212,13 @@ function summarizeClaudeToolInput(
     return {
       detailLabel: "plan",
       detailPreview: summarizeClaudePlan(toolInput.plan),
+    };
+  }
+
+  if (toolName === "AskUserQuestion" && Array.isArray(toolInput.questions)) {
+    return {
+      detailLabel: "question",
+      detailPreview: formatAskUserQuestions(toolInput.questions),
     };
   }
 
