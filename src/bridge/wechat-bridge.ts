@@ -683,6 +683,61 @@ async function handleInboundMessage(params: {
     return null;
   }
 
+  // AskUserQuestion: handle option selection and custom text before the command switch.
+  const pendingAskUser = state.pendingConfirmation;
+  if (
+    pendingAskUser?.toolName === "AskUserQuestion" &&
+    pendingAskUser.askUserQuestions &&
+    pendingAskUser.askUserQuestions.length > 0
+  ) {
+    const input = message.text.trim();
+
+    if (systemCommand?.type === "deny") {
+      // Fall through to the switch deny handler below.
+    } else if (systemCommand?.type === "confirm") {
+      await queueWechatMessage(
+        message.senderId,
+        "Please select an option by number (e.g. 1) or type your answer. Reply with /deny to reject.",
+      );
+      return null;
+    } else {
+      const numericMatch = input.match(/^[\d,.\s]+$/);
+      let responseText: string;
+
+      if (numericMatch) {
+        const indices = input
+          .split(/[,.\s]+/)
+          .map(Number)
+          .filter((n) => n >= 1 && n <= pendingAskUser.askUserQuestions!.length);
+        if (indices.length > 0) {
+          responseText = indices
+            .map((i) => pendingAskUser.askUserQuestions![i - 1].label)
+            .join("\n");
+        } else {
+          responseText = input;
+        }
+      } else {
+        responseText = input;
+      }
+
+      const confirmed = await adapter.resolveApproval("confirm", responseText);
+      if (!confirmed) {
+        await queueWechatMessage(
+          message.senderId,
+          "The worker could not apply this approval request.",
+        );
+        return null;
+      }
+      stateStore.clearPendingConfirmation();
+      stateStore.appendLog(`AskUserQuestion answered: ${truncatePreview(responseText, 80)}`);
+      await queueWechatMessage(message.senderId, "Option sent. Continuing...");
+      return {
+        startedAt: Date.now(),
+        inputPreview: pendingAskUser.commandPreview,
+      };
+    }
+  }
+
   switch (systemCommand?.type) {
     case "status":
       await queueWechatMessage(

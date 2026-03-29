@@ -260,7 +260,7 @@ export function buildClaudePermissionApprovalRequest(
       : "Tool";
   const { detailLabel, detailPreview } = summarizeClaudeToolInput(toolName, payload.tool_input);
 
-  return {
+  const result: ApprovalRequest = {
     source: "cli",
     summary: `Claude permission is required for ${toolName}.`,
     commandPreview: `${toolName}: ${detailPreview}`,
@@ -268,6 +268,30 @@ export function buildClaudePermissionApprovalRequest(
     detailLabel,
     detailPreview,
   };
+
+  if (
+    toolName === "AskUserQuestion" &&
+    Array.isArray((payload.tool_input as Record<string, unknown>)?.questions)
+  ) {
+    const questions = (payload.tool_input as Record<string, unknown>).questions as Array<{
+      options?: Array<{ label?: string; description?: string }>;
+    }>;
+    const options: AskUserQuestionOption[] = [];
+    for (const q of questions) {
+      if (Array.isArray(q?.options)) {
+        for (const opt of q.options) {
+          if (opt.label) {
+            options.push({ label: opt.label, description: opt.description });
+          }
+        }
+      }
+    }
+    if (options.length > 0) {
+      result.askUserQuestions = options;
+    }
+  }
+
+  return result;
 }
 
 export function buildClaudePermissionDecisionHookOutput(

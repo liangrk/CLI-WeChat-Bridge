@@ -22,6 +22,11 @@ export type BridgeNoticeLevel = "info" | "warning";
 
 export type ApprovalSource = "shell" | "cli";
 
+export type AskUserQuestionOption = {
+  label: string;
+  description?: string;
+};
+
 export type ApprovalRequest = {
   source: ApprovalSource;
   summary: string;
@@ -32,6 +37,7 @@ export type ApprovalRequest = {
   requestId?: string;
   confirmInput?: string;
   denyInput?: string;
+  askUserQuestions?: AskUserQuestionOption[];
 };
 
 export type PendingApproval = ApprovalRequest & {
@@ -171,7 +177,7 @@ export interface BridgeAdapter {
   resumeSession(sessionId: string): Promise<void>;
   interrupt(): Promise<boolean>;
   reset(): Promise<void>;
-  resolveApproval(action: "confirm" | "deny"): Promise<boolean>;
+  resolveApproval(action: "confirm" | "deny", text?: string): Promise<boolean>;
   dispose(): Promise<void>;
   getState(): BridgeAdapterState;
 }

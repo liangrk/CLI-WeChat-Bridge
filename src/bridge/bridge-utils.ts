@@ -469,6 +469,21 @@ export function formatApprovalMessage(
 ): string {
   const isClaude = adapterState.kind === "claude";
   if (isClaude) {
+    const isAskUserQuestion =
+      pending.toolName === "AskUserQuestion" &&
+      pending.askUserQuestions &&
+      pending.askUserQuestions.length > 0;
+    if (isAskUserQuestion) {
+      return [
+        "Claude permission request.",
+        ...(pending.toolName ? [`tool: ${pending.toolName}`] : []),
+        ...(pending.detailPreview
+          ? [`${pending.detailLabel ?? "details"}: ${pending.detailPreview}`]
+          : []),
+        "Reply with a number to select an option, or type your answer.",
+        "Reply with /deny or no to reject.",
+      ].join("\n");
+    }
     return [
       "Claude permission request.",
       ...(pending.toolName ? [`tool: ${pending.toolName}`] : []),

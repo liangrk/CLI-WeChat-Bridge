@@ -211,7 +211,7 @@ async function main(): Promise<void> {
             sendResponse(
               message.id,
               true,
-              await adapter.resolveApproval(message.payload.action),
+              await adapter.resolveApproval(message.payload.action, message.payload.text),
             );
             break;
           case "dispose":

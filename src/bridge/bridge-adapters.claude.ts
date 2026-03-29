@@ -232,7 +232,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     await super.reset();
   }
 
-  override async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
+  override async resolveApproval(action: "confirm" | "deny", text?: string): Promise<boolean> {
     if (!this.pendingApproval) {
       return false;
     }
@@ -251,9 +251,10 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     }
 
     const input =
-      action === "confirm"
+      text ??
+      (action === "confirm"
         ? this.pendingApproval.confirmInput ?? "\r"
-        : this.pendingApproval.denyInput ?? "n\r";
+        : this.pendingApproval.denyInput ?? "n\r");
 
     this.clearWechatWorkingNotice();
     this.pendingCliApprovalHints = null;
@@ -1100,7 +1101,9 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     // ExitPlanMode has a known bug where hook "allow" doesn't exit plan mode
     // (https://github.com/anthropics/claude-code/issues/15755). Skip the hook
     // and let Claude Code's native terminal handle the approval via PTY.
-    if (toolName === "ExitPlanMode") {
+    // AskUserQuestion also uses PTY fallback so the user can select options
+    // or provide custom text via WeChat instead of just allow/deny.
+    if (toolName === "ExitPlanMode" || toolName === "AskUserQuestion") {
       this.respondToClaudeHook(socket, requestId, undefined);
       const request = buildClaudePermissionApprovalRequest(payload);
       this.pendingApproval = {

@@ -243,7 +243,7 @@ export class CodexPtyAdapter extends AbstractPtyAdapter {
     return true;
   }
 
-  override async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
+  override async resolveApproval(action: "confirm" | "deny", _text?: string): Promise<boolean> {
     if (!this.pendingApproval) {
       return false;
     }

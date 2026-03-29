@@ -165,10 +165,11 @@ export class LocalCompanionProxyAdapter implements BridgeAdapter {
     });
   }
 
-  async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
+  async resolveApproval(action: "confirm" | "deny", text?: string): Promise<boolean> {
     const result = await this.sendRequest({
       command: "resolve_approval",
       action,
+      ...(text ? { text } : {}),
     });
     return Boolean(result);
   }
@@ -502,7 +503,7 @@ export abstract class AbstractPtyAdapter implements BridgeAdapter {
     await this.start();
   }
 
-  async resolveApproval(action: "confirm" | "deny"): Promise<boolean> {
+  async resolveApproval(action: "confirm" | "deny", _text?: string): Promise<boolean> {
     if (!this.pendingApproval) {
       return false;
     }
