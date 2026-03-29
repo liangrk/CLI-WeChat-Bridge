@@ -262,7 +262,7 @@ export function detectCliApproval(text: string): ApprovalRequest | null {
 }
 
 const CLI_ERROR_PATTERNS = [
-  /^Unknown skill:/m,
+  /Unknown skill:/,
   /^Error:/m,
   /^Failed to/m,
 ];
@@ -272,10 +272,12 @@ export function detectCliError(text: string): string | null {
     if (pattern.test(text)) {
       const firstLine = text.split("\n").find((line) => {
         const trimmed = line.trim();
-        return trimmed.length > 0 && !trimmed.startsWith("❯");
+        return trimmed.length > 0 && pattern.test(trimmed);
       });
       if (firstLine) {
-        return firstLine.trim().slice(0, 200);
+        // Strip leading prompt symbols (❯, ●, etc.)
+        const cleaned = firstLine.trim().replace(/^[\s\S]*?(Unknown skill:|Error:|Failed to)/, "$1");
+        return cleaned.slice(0, 200);
       }
     }
   }
