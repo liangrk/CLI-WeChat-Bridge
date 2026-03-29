@@ -271,13 +271,10 @@ export function detectCliError(text: string): string | null {
   for (const pattern of CLI_ERROR_PATTERNS) {
     if (pattern.test(text)) {
       const firstLine = text.split("\n").find((line) => {
-        const trimmed = line.trim();
-        return trimmed.length > 0 && pattern.test(trimmed);
+        return line.trim().length > 0;
       });
       if (firstLine) {
-        // Strip leading prompt symbols (❯, ●, etc.)
-        const cleaned = firstLine.trim().replace(/^[\s\S]*?(Unknown skill:|Error:|Failed to)/, "$1");
-        return cleaned.slice(0, 200);
+        return firstLine.trim().slice(0, 200);
       }
     }
   }
