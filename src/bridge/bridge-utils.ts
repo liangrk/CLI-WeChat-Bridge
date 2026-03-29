@@ -261,6 +261,27 @@ export function detectCliApproval(text: string): ApprovalRequest | null {
   };
 }
 
+const CLI_ERROR_PATTERNS = [
+  /^Unknown skill:/m,
+  /^Error:/m,
+  /^Failed to/m,
+];
+
+export function detectCliError(text: string): string | null {
+  for (const pattern of CLI_ERROR_PATTERNS) {
+    if (pattern.test(text)) {
+      const firstLine = text.split("\n").find((line) => {
+        const trimmed = line.trim();
+        return trimmed.length > 0 && !trimmed.startsWith("❯");
+      });
+      if (firstLine) {
+        return firstLine.trim().slice(0, 200);
+      }
+    }
+  }
+  return null;
+}
+
 export function formatDuration(durationMs: number): string {
   if (!Number.isFinite(durationMs) || durationMs < 0) {
     return "0s";

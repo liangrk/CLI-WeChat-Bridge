@@ -26,6 +26,7 @@ import type {
 } from "./bridge-types.ts";
 import {
   detectCliApproval,
+  detectCliError,
   normalizeOutput,
   nowIso,
   truncatePreview,
@@ -353,6 +354,17 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         });
       }
       return;
+    }
+
+    // Detect CLI-level errors (not covered by hooks) and forward to WeChat
+    const cliError = detectCliError(text);
+    if (cliError) {
+      this.emit({
+        type: "notice",
+        text: cliError,
+        level: "warning",
+        timestamp: nowIso(),
+      });
     }
 
     if (!this.hasAcceptedInput) {
