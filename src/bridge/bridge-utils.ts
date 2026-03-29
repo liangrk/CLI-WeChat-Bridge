@@ -270,7 +270,7 @@ const CLI_ERROR_PATTERNS = [
 export function detectCliError(text: string): string | null {
   for (const pattern of CLI_ERROR_PATTERNS) {
     if (pattern.test(text)) {
-      return text.trim().slice(0, 500);
+      return text.trim();
     }
   }
   return null;
