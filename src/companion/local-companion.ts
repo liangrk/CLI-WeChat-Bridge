@@ -355,11 +355,22 @@ async function runHubMode(
   );
 
   // Graceful shutdown
+  const FORCE_EXIT_TIMEOUT_MS = 3_000;
+  let forceExitTimer: ReturnType<typeof setTimeout> | null = null;
+
   const closeCompanion = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     stopHeartbeat();
     detachListener?.();
+
+    // Force exit after timeout if dispose() hangs
+    forceExitTimer = setTimeout(() => {
+      log(options.adapter, "Graceful shutdown timed out, forcing exit");
+      try { socket.destroy(); } catch { /* ignore */ }
+      process.exit(1);
+    }, FORCE_EXIT_TIMEOUT_MS);
+
     try {
       await adapter.dispose();
     } catch {
@@ -370,6 +381,10 @@ async function runHubMode(
       socket.destroy();
     } catch {
       // Best effort.
+    }
+    if (forceExitTimer) {
+      clearTimeout(forceExitTimer);
+      forceExitTimer = null;
     }
   };
 
@@ -447,6 +462,9 @@ async function runSingleProjectMode(
     });
   };
 
+  const FORCE_EXIT_TIMEOUT_MS = 3_000;
+  let forceExitTimer: ReturnType<typeof setTimeout> | null = null;
+
   const closeCompanion = async (exitCode = 0) => {
     if (shuttingDown) {
       return;
@@ -455,6 +473,14 @@ async function runSingleProjectMode(
 
     detachListener?.();
     detachListener = null;
+
+    // Force exit after timeout if dispose() hangs
+    forceExitTimer = setTimeout(() => {
+      log(options.adapter, "Graceful shutdown timed out, forcing exit");
+      try { socket.destroy(); } catch { /* ignore */ }
+      process.exit(1);
+    }, FORCE_EXIT_TIMEOUT_MS);
+
     try {
       await adapter.dispose();
     } catch {
@@ -465,6 +491,10 @@ async function runSingleProjectMode(
       socket.destroy();
     } catch {
       // Best effort cleanup.
+    }
+    if (forceExitTimer) {
+      clearTimeout(forceExitTimer);
+      forceExitTimer = null;
     }
     process.exit(exitCode);
   };

@@ -95,27 +95,54 @@ export class HubServer {
 
   async start(): Promise<number> {
     return new Promise((resolve, reject) => {
-      this.server = net.createServer((socket) => {
-        this.handleConnection(socket);
+      // Check if another Hub is already running on this port
+      const probe = net.connect({ host: "127.0.0.1", port: this.port });
+      const probeTimer = setTimeout(() => {
+        probe.destroy();
+        // Port is free, proceed with binding
+        this.bindServer(resolve, reject);
+      }, 500);
+      probe.once("connect", () => {
+        clearTimeout(probeTimer);
+        probe.destroy();
+        reject(
+          new Error(
+            `Hub is already running on port ${this.port}. Only one Hub instance can be active at a time. Kill the existing Hub process first.`,
+          ),
+        );
       });
-
-      this.server.on("error", (err) => {
-        this.logError(`Hub server error: ${err.message}`);
-        reject(err);
+      probe.once("error", () => {
+        clearTimeout(probeTimer);
+        // Port is free, proceed with binding
+        this.bindServer(resolve, reject);
       });
+    });
+  }
 
-      this.server.listen(this.port, "127.0.0.1", () => {
-        const addr = this.server!.address();
-        const actualPort =
-          typeof addr === "object" && addr ? addr.port : this.port;
-        this.log(`Hub server listening on 127.0.0.1:${actualPort}`);
+  private bindServer(
+    resolve: (value: number) => void,
+    reject: (reason: Error) => void,
+  ): void {
+    this.server = net.createServer((socket) => {
+      this.handleConnection(socket);
+    });
 
-        this.heartbeatTimer = setInterval(() => {
-          this.checkHeartbeats();
-        }, HEARTBEAT_CHECK_INTERVAL_MS);
+    this.server.on("error", (err) => {
+      this.logError(`Hub server error: ${err.message}`);
+      reject(err);
+    });
 
-        resolve(actualPort);
-      });
+    this.server.listen(this.port, "127.0.0.1", () => {
+      const addr = this.server!.address();
+      const actualPort =
+        typeof addr === "object" && addr ? addr.port : this.port;
+      this.log(`Hub server listening on 127.0.0.1:${actualPort}`);
+
+      this.heartbeatTimer = setInterval(() => {
+        this.checkHeartbeats();
+      }, HEARTBEAT_CHECK_INTERVAL_MS);
+
+      resolve(actualPort);
     });
   }
 
