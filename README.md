@@ -170,6 +170,41 @@ wechat-claude-go
 wechat-claude-go --dangerously-skip-permissions
 ```
 
+#### Hub 模式（多项目）
+
+Hub 模式允许一个 bridge 进程同时管理多个项目的 Claude Code 实例。
+
+终端 A（启动 Hub）：
+
+```bash
+wechat-bridge-claude --hub
+```
+
+终端 B+（在每个项目目录下分别启动 spoke）：
+
+```bash
+cd D:\work\project-a
+wechat-claude
+
+cd D:\work\project-b
+wechat-claude
+```
+
+Hub 启动后会监听固定端口 `18760`，spoke 自动发现并连接 Hub。
+
+**消息路由规则：**
+
+| 场景 | 用法 |
+| --- | --- |
+| 只有 1 个在线项目 | 直接发送消息或命令，无需前缀 |
+| 多个在线项目 | 使用 `[项目名]` 前缀指定目标，如 `[project-a] /clear` |
+| 查看所有项目 | 发送 `/projects` |
+| 查看详细状态 | 发送 `/status` |
+
+**项目上线/离线通知：** spoke 连接或断开时，Hub 会自动向微信发送通知，如 `[project-a] 项目已上线`。
+
+**Spoke 断线重连：** spoke 与 Hub 失去连接后会自动以指数退避策略重连（最大间隔 30s），无需手动重启。
+
 ![Claude Windows](docs/images/image-6.png)
 
 ![Claude Linux](docs/images/image-7.png)
@@ -233,12 +268,33 @@ wechat-bridge-shell --cmd pwsh.exe
 
 ## 微信侧支持的指令
 
+### 单项目模式
+
 | 指令 | 说明 |
 | --- | --- |
 | 普通文本 | 发送给当前活动会话 |
 | `/status` | 查看 bridge 当前状态 |
 | `/stop` | 中断当前任务 |
 | `/reset` | 重建当前本地会话 |
+| `/clear` | 清空 Claude Code 对话（等同于在本地输入 `/clear`） |
+| `/plan` | 进入 Claude Code 计划模式 |
+| `/confirm` | 确认审批请求 |
+| `/deny` | 拒绝审批请求 |
+
+### Hub 模式（`--hub`）
+
+| 指令 | 说明 |
+| --- | --- |
+| 普通文本 | 发送给唯一在线项目（多项目时需加前缀） |
+| `[项目名] 消息` | 发送消息到指定项目 |
+| `[项目名] /clear` | 对指定项目执行 `/clear` 命令 |
+| `[项目名] /plan` | 对指定项目进入计划模式 |
+| `/projects` | 列出所有在线项目及状态 |
+| `/status` | 查看所有项目详细状态 |
+| `/stop [项目名]` | 中断指定项目（不指定则提示选择） |
+| `/reset [项目名]` | 重置指定项目（不指定则提示选择） |
+| `/confirm` | 确认审批请求（自动路由到有待审批的项目） |
+| `/deny` | 拒绝审批请求 |
 
 ## 工作区模型
 
@@ -359,7 +415,7 @@ npm install -g .
 - `codex` 是当前优先支持的路径
 - `claude code` 当前已切到 companion + 纯 Hook 方案（不再通过 PTY stdout 转发到微信）
 - `codex` 模式下微信 `/resume` 被禁用
-- 当前模型是单 owner、单 bridge、单活动工作区
+- Hub 模式下同一时间只能运行一个 Hub 实例
 - `claude code` 远程审批链路现已可用；微信侧可直接确认或拒绝 Claude 的权限请求
 
 
@@ -369,9 +425,11 @@ npm install -g .
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/bridge/wechat-bridge.ts` | bridge 主事件循环 |
+| `src/bridge/wechat-bridge.ts` | bridge 主事件循环（单项目模式 + Hub 模式） |
+| `src/bridge/hub-server.ts` | Hub TCP 服务器，管理多 spoke 连接与消息路由 |
 | `src/bridge/bridge-adapters.ts` | `codex` / `claude` / `shell` 适配器实现 |
-| `src/companion/local-companion.ts` | `wechat-codex` / `wechat-claude` 本地 companion 入口 |
+| `src/companion/local-companion.ts` | `wechat-codex` / `wechat-claude` 本地 companion 入口（自动发现 Hub） |
+| `src/companion/local-companion-link.ts` | companion 与 bridge/Hub 的本地 IPC 协议 |
 | `src/companion/codex-panel.ts` | Codex panel 入口（备用） |
 | `src/companion/codex-panel-link.ts` | bridge 与 Codex panel 的本地 IPC |
 | `src/wechat/wechat-transport.ts` | iLink 消息收发、引用消息解析 |
