@@ -429,7 +429,7 @@ export class HubServer {
       case "event": {
         if (!spoke.projectName) return;
 
-        this.log(`[${spoke.projectName}] event: ${message.event.type}${message.event.type === "notice" ? ` (${message.event.level}): ${JSON.stringify(message.event.text).slice(0, 100)}` : ""}`);
+        this.log(`[${spoke.projectName}] event: ${message.event.type} ${JSON.stringify(message.event).slice(0, 300)}`);
 
         // Track approval state
         if (message.event.type === "approval_required") {
