@@ -638,7 +638,11 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       }
 
       this.workingNoticeSent = true;
-      this.emitClaudeNotice(`Claude is still working on:\n${this.currentPreview}`);
+      let noticeText = `Claude is still working on:\n${this.currentPreview}`;
+      if (this.queuedInputCount > 0) {
+        noticeText += `\n排队中: ${this.queuedInputCount} 条消息等待处理`;
+      }
+      this.emitClaudeNotice(noticeText);
     }, this.workingNoticeDelayMs);
     this.workingNoticeTimer.unref?.();
   }
