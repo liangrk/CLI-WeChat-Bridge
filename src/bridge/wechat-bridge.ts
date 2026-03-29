@@ -478,6 +478,16 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
 
   let sendChain = Promise.resolve();
   let replySendChain = Promise.resolve();
+  let wechatReady = false;
+  // Queue messages until first successful poll refreshes context_token
+  const pendingNotifications: Array<{ senderId: string; text: string }> = [];
+
+  const flushPendingNotifications = () => {
+    while (pendingNotifications.length > 0) {
+      const msg = pendingNotifications.shift()!;
+      void queueWechatMessage(msg.senderId, msg.text);
+    }
+  };
 
   const sendWithRetry = async (senderId: string, text: string, channel?: string) => {
     const maxRetries = 3;
@@ -499,11 +509,19 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
   };
 
   const queueWechatMessage = (senderId: string, text: string) => {
+    if (!wechatReady) {
+      pendingNotifications.push({ senderId, text });
+      return Promise.resolve();
+    }
     sendChain = sendChain.then(() => sendWithRetry(senderId, text, "hub"));
     return sendChain;
   };
 
   const queueReplyMessage = (senderId: string, text: string) => {
+    if (!wechatReady) {
+      pendingNotifications.push({ senderId, text });
+      return Promise.resolve();
+    }
     replySendChain = replySendChain.then(() => sendWithRetry(senderId, text, "hub-reply"));
     return replySendChain;
   };
@@ -602,11 +620,23 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
     while (true) {
       let pollResult;
       try {
+        // Use wide grace window on first poll to receive any message
+        // and refresh context_token so we can send notifications
+        const minCreatedAt = wechatReady
+          ? Date.now() - MESSAGE_START_GRACE_MS
+          : 0;
         pollResult = await transport.pollMessages({
           timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
-          minCreatedAtMs: Date.now() - MESSAGE_START_GRACE_MS,
+          minCreatedAtMs: minCreatedAt,
         });
         consecutivePollFailures = 0;
+
+        // Mark WeChat ready after first poll that returns messages
+        if (!wechatReady && pollResult.messages.length > 0) {
+          wechatReady = true;
+          log("WeChat connection ready, flushing pending notifications...");
+          flushPendingNotifications();
+        }
       } catch (err) {
         if (err instanceof WeChatSessionExpiredError) {
           logError(err.message);
