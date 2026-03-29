@@ -72,9 +72,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private pendingInputQueue: string[] = [];
   private queuedInputCount = 0;
   private staleBusyTimer: ReturnType<typeof setTimeout> | null = null;
-  private ptyApprovalRetryCount = 0;
   private ptyApprovalRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly PTY_APPROVAL_MAX_RETRIES = 3;
   private static readonly PTY_APPROVAL_RETRY_DELAY_MS = 1_500;
   private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly HEARTBEAT_INTERVAL_MS = 60_000;
@@ -250,11 +248,15 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       }
     }
 
-    const input =
+    const rawInput =
       text ??
       (action === "confirm"
         ? this.pendingApproval.confirmInput ?? "\r"
         : this.pendingApproval.denyInput ?? "n\r");
+
+    // prepareInput adds trailing \r and normalizes \n -> \r for PTY input.
+    // Only apply when text is explicitly provided; fallback values already include \r.
+    const input = text ? this.prepareInput(text) : rawInput;
 
     this.clearWechatWorkingNotice();
     this.pendingCliApprovalHints = null;
@@ -820,32 +822,22 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   }
 
   /**
-   * Write approval input to PTY with retry for Windows ConPTY buffering issues.
+   * Write approval input to PTY with best-effort retry for Windows ConPTY buffering.
    * On Windows, ConPTY may buffer PTY input when the terminal is not in the foreground.
-   * Retry up to PTY_APPROVAL_MAX_RETRIES times at PTY_APPROVAL_RETRY_DELAY_MS intervals.
    */
   private writePtyApprovalWithRetry(input: string): void {
     this.clearPtyApprovalRetry();
     this.writeToPty(input);
 
-    // Only retry if this is a PTY-based approval (no requestId) and status is still awaiting_approval
-    if (!this.pendingApproval?.requestId && this.state.status === "awaiting_approval") {
-      this.ptyApprovalRetryCount = 0;
-      this.ptyApprovalRetryTimer = setTimeout(() => {
-        this.ptyApprovalRetryTimer = null;
-        if (
-          this.state.status === "awaiting_approval" &&
-          !this.pendingApproval?.requestId
-        ) {
-          this.writeToPty(input);
-          this.ptyApprovalRetryCount++;
-          if (this.ptyApprovalRetryCount < ClaudeCompanionAdapter.PTY_APPROVAL_MAX_RETRIES) {
-            this.executePtyApprovalRetry(input);
-          }
-        }
-      }, ClaudeCompanionAdapter.PTY_APPROVAL_RETRY_DELAY_MS);
-      this.ptyApprovalRetryTimer?.unref?.();
-    }
+    // Best-effort retry: re-send once after a short delay if still busy,
+    // in case ConPTY did not deliver the first write.
+    this.ptyApprovalRetryTimer = setTimeout(() => {
+      this.ptyApprovalRetryTimer = null;
+      if (this.state.status === "busy") {
+        this.writeToPty(input);
+      }
+    }, ClaudeCompanionAdapter.PTY_APPROVAL_RETRY_DELAY_MS);
+    this.ptyApprovalRetryTimer?.unref?.();
   }
 
   private clearPtyApprovalRetry(): void {
@@ -853,7 +845,6 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       clearTimeout(this.ptyApprovalRetryTimer);
       this.ptyApprovalRetryTimer = null;
     }
-    this.ptyApprovalRetryCount = 0;
   }
   private handleClaudeHookEnvelope(params: {
     requestId: string;

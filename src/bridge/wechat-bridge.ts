@@ -710,9 +710,7 @@ async function handleInboundMessage(params: {
           .map(Number)
           .filter((n) => n >= 1 && n <= pendingAskUser.askUserQuestions!.length);
         if (indices.length > 0) {
-          responseText = indices
-            .map((i) => pendingAskUser.askUserQuestions![i - 1].label)
-            .join("\n");
+          responseText = indices.join(", ");
         } else {
           responseText = input;
         }
