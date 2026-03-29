@@ -90,7 +90,6 @@ export function extractClaudeResumeConversationId(
 
 export function buildClaudeHookSettings(
   command: string,
-  options?: { skipPermissionHooks?: boolean },
 ): Record<string, unknown> {
   const hook = {
     hooks: [
@@ -104,20 +103,16 @@ export function buildClaudeHookSettings(
   const hooks: Record<string, unknown> = {
     SessionStart: [hook],
     UserPromptSubmit: [hook],
-  };
-
-  if (!options?.skipPermissionHooks) {
-    hooks.PermissionRequest = [hook];
-    hooks.Notification = [
+    PermissionRequest: [hook],
+    Notification: [
       {
         matcher: "permission_prompt",
         hooks: hook.hooks,
       },
-    ];
-  }
-
-  hooks.Stop = [hook];
-  hooks.StopFailure = [hook];
+    ],
+    Stop: [hook],
+    StopFailure: [hook],
+  };
 
   return { hooks };
 }

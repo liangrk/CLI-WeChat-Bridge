@@ -48,19 +48,13 @@ describe("buildClaudeHookSettings", () => {
     ]);
   });
 
-  test("excludes permission hooks when skipPermissionHooks is set", () => {
-    const settings = buildClaudeHookSettings('"C:\\hook.cmd"', {
-      skipPermissionHooks: true,
-    }) as { hooks: Record<string, unknown> };
+  test("always includes permission hooks regardless of dangerouslySkipPermissions", () => {
+    const settings = buildClaudeHookSettings('"C:\\hook.cmd"') as {
+      hooks: Record<string, unknown>;
+    };
 
-    expect(Object.keys(settings.hooks)).toEqual([
-      "SessionStart",
-      "UserPromptSubmit",
-      "Stop",
-      "StopFailure",
-    ]);
-    expect(settings.hooks).not.toHaveProperty("PermissionRequest");
-    expect(settings.hooks).not.toHaveProperty("Notification");
+    expect(settings.hooks).toHaveProperty("PermissionRequest");
+    expect(settings.hooks).toHaveProperty("Notification");
   });
 });
 

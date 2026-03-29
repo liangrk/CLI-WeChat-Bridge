@@ -524,9 +524,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     fs.writeFileSync(
       settingsFilePath,
       JSON.stringify(
-        buildClaudeHookSettings(hookCommand, {
-          skipPermissionHooks: this.options.dangerouslySkipPermissions ?? false,
-        }),
+        buildClaudeHookSettings(hookCommand),
         null,
         2,
       ),
