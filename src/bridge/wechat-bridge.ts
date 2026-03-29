@@ -478,8 +478,8 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
 
   let sendChain = Promise.resolve();
   let replySendChain = Promise.resolve();
-  let wechatReady = false;
-  // Queue messages until first successful poll refreshes context_token
+  // Queue for notifications that fail to send (e.g. stale context_token)
+  // They get retried after the next successful message receive refreshes the token
   const pendingNotifications: Array<{ senderId: string; text: string }> = [];
 
   const flushPendingNotifications = () => {
@@ -489,13 +489,13 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
     }
   };
 
-  const sendWithRetry = async (senderId: string, text: string, channel?: string) => {
+  const sendWithRetry = async (senderId: string, text: string, channel?: string): Promise<boolean> => {
     const maxRetries = 3;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         await transport.sendText(senderId, text);
         if (channel) log(`${channel} message sent: ${truncatePreview(text, 80)}`);
-        return;
+        return true;
       } catch (err) {
         const errorText = err instanceof Error ? err.message : String(err);
         if (attempt < maxRetries) {
@@ -506,23 +506,26 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
         }
       }
     }
+    return false;
   };
 
   const queueWechatMessage = (senderId: string, text: string) => {
-    if (!wechatReady) {
-      pendingNotifications.push({ senderId, text });
-      return Promise.resolve();
-    }
-    sendChain = sendChain.then(() => sendWithRetry(senderId, text, "hub"));
+    sendChain = sendChain.then(async () => {
+      const ok = await sendWithRetry(senderId, text, "hub");
+      if (!ok) {
+        pendingNotifications.push({ senderId, text });
+      }
+    });
     return sendChain;
   };
 
   const queueReplyMessage = (senderId: string, text: string) => {
-    if (!wechatReady) {
-      pendingNotifications.push({ senderId, text });
-      return Promise.resolve();
-    }
-    replySendChain = replySendChain.then(() => sendWithRetry(senderId, text, "hub-reply"));
+    replySendChain = replySendChain.then(async () => {
+      const ok = await sendWithRetry(senderId, text, "hub-reply");
+      if (!ok) {
+        pendingNotifications.push({ senderId, text });
+      }
+    });
     return replySendChain;
   };
 
@@ -610,51 +613,25 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
   });
 
   try {
-    // Initial short poll to refresh context_token before accepting spokes
-    log("Warming up WeChat connection (initial poll)...");
-    try {
-      const warmup = await transport.pollMessages({
-        timeoutMs: 5_000,
-        minCreatedAtMs: 0,
-      });
-      if (warmup.messages.length > 0) {
-        wechatReady = true;
-        log(`WeChat ready (received ${warmup.messages.length} warmup message(s)).`);
-      }
-    } catch {
-      log("Initial poll failed (will retry in main loop).");
-    }
-
     const port = await hub.start();
     log(`Hub mode active on port ${port}.`);
     log(`Authorized WeChat user: ${credentials.userId}`);
     log('Start companion(s) in project directories with: wechat-claude');
-
-    // Flush any notifications queued during warmup
-    if (wechatReady) {
-      flushPendingNotifications();
-    }
 
     let consecutivePollFailures = 0;
 
     while (true) {
       let pollResult;
       try {
-        // Use wide grace window on first poll to receive any message
-        // and refresh context_token so we can send notifications
-        const minCreatedAt = wechatReady
-          ? Date.now() - MESSAGE_START_GRACE_MS
-          : 0;
         pollResult = await transport.pollMessages({
           timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
-          minCreatedAtMs: minCreatedAt,
+          minCreatedAtMs: Date.now() - MESSAGE_START_GRACE_MS,
         });
         consecutivePollFailures = 0;
 
-        // Mark WeChat ready after first poll that returns messages
-        if (!wechatReady && pollResult.messages.length > 0) {
-          wechatReady = true;
-          log("WeChat connection ready, flushing pending notifications...");
+        // Flush pending notifications after receiving messages (context_token refreshed)
+        if (pollResult.messages.length > 0 && pendingNotifications.length > 0) {
+          log(`Flushing ${pendingNotifications.length} pending notification(s)...`);
           flushPendingNotifications();
         }
       } catch (err) {
