@@ -610,10 +610,30 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
   });
 
   try {
+    // Initial short poll to refresh context_token before accepting spokes
+    log("Warming up WeChat connection (initial poll)...");
+    try {
+      const warmup = await transport.pollMessages({
+        timeoutMs: 5_000,
+        minCreatedAtMs: 0,
+      });
+      if (warmup.messages.length > 0) {
+        wechatReady = true;
+        log(`WeChat ready (received ${warmup.messages.length} warmup message(s)).`);
+      }
+    } catch {
+      log("Initial poll failed (will retry in main loop).");
+    }
+
     const port = await hub.start();
     log(`Hub mode active on port ${port}.`);
     log(`Authorized WeChat user: ${credentials.userId}`);
     log('Start companion(s) in project directories with: wechat-claude');
+
+    // Flush any notifications queued during warmup
+    if (wechatReady) {
+      flushPendingNotifications();
+    }
 
     let consecutivePollFailures = 0;
 
