@@ -820,6 +820,44 @@ describe("Claude CLI compatibility", () => {
     await adapter.dispose();
   });
 
+  test("emits approval_required from Notification permission_prompt when no pendingApproval exists", async () => {
+    const adapter = createBridgeAdapter({
+      kind: "claude",
+      command: "claude",
+      cwd: process.cwd(),
+      renderMode: "companion",
+    }) as any;
+    const events: Array<{ type: string }> = [];
+    adapter.setEventSink((event: { type: string }) => events.push(event));
+    adapter.renderLocalOutput = () => undefined;
+    adapter.hasAcceptedInput = true;
+    adapter.state.status = "busy";
+    adapter.state.activeTurnOrigin = "wechat";
+
+    adapter.handleClaudeHookEnvelope({
+      requestId: "notif-1",
+      rawPayload: JSON.stringify({
+        hook_event_name: "Notification",
+        notification_type: "permission_prompt",
+        tool_name: "Bash",
+        message: "Allow Bash to run: npm test",
+      }),
+      socket: { end() {}, destroy() {} } as any,
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "approval_required" }),
+    );
+    expect(adapter.pendingApproval).toMatchObject({
+      source: "cli",
+      toolName: "Bash",
+      commandPreview: "Allow Bash to run: npm test",
+    });
+
+    adapter.flushPendingClaudeHookApprovals();
+    await adapter.dispose();
+  });
+
   test("cancels the pending Claude working notice once the final reply arrives", async () => {
     const adapter = createBridgeAdapter({
       kind: "claude",

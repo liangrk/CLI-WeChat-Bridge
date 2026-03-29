@@ -173,7 +173,76 @@ async function main(): Promise<void> {
   let lastOutputAt = 0;
   let lastHeartbeatAt = 0;
 
+  // --- Rate-limit detection and pending message queue ---
+
+  function isRateLimitError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/\bHTTP\s+429\b/.test(msg)) return true;
+    if (/\berrcode["\s:]*-?\d+/.test(msg) && /限[频流]|too\s+(many|frequent)|rate/i.test(msg)) return true;
+    return false;
+  }
+
+  interface PendingMessage {
+    senderId: string;
+    text: string;
+    channel: string;
+  }
+
+  let pendingMessages: PendingMessage[] = [];
+  let rateLimitBackoffMs = 2_000;
+  const RATE_LIMIT_MAX_BACKOFF_MS = 60_000;
+  let pendingPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let isRateLimited = false;
+
+  function enqueuePending(senderId: string, text: string, channel: string): void {
+    pendingMessages.push({ senderId, text, channel });
+    log(`Rate limited, queued message (${pendingMessages.length} pending)`);
+    startPendingPoll();
+  }
+
+  function startPendingPoll(): void {
+    if (pendingPollTimer) return;
+    pendingPollTimer = setTimeout(flushPendingQueue, rateLimitBackoffMs);
+  }
+
+  async function flushPendingQueue(): Promise<void> {
+    pendingPollTimer = null;
+    if (pendingMessages.length === 0) {
+      isRateLimited = false;
+      rateLimitBackoffMs = 2_000;
+      return;
+    }
+
+    const msg = pendingMessages[0];
+    try {
+      await transport.sendText(msg.senderId, msg.text);
+      pendingMessages.shift();
+      log(`${msg.channel} pending sent (${pendingMessages.length} remaining)`);
+      rateLimitBackoffMs = 2_000;
+    } catch (err) {
+      if (isRateLimitError(err)) {
+        rateLimitBackoffMs = Math.min(rateLimitBackoffMs * 2, RATE_LIMIT_MAX_BACKOFF_MS);
+        log(`Still rate limited, backing off to ${rateLimitBackoffMs}ms`);
+      } else {
+        logError(`Pending send failed: ${err instanceof Error ? err.message : err}`);
+        pendingMessages.shift();
+      }
+    }
+
+    if (pendingMessages.length > 0) {
+      startPendingPoll();
+    } else {
+      isRateLimited = false;
+      rateLimitBackoffMs = 2_000;
+    }
+  }
+
   const sendWithRetry = async (senderId: string, text: string, channel?: string) => {
+    if (isRateLimited) {
+      enqueuePending(senderId, text, channel ?? "queued");
+      return;
+    }
+
     const maxRetries = 3;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
@@ -182,6 +251,11 @@ async function main(): Promise<void> {
         return;
       } catch (err) {
         const errorText = err instanceof Error ? err.message : String(err);
+        if (isRateLimitError(err)) {
+          isRateLimited = true;
+          enqueuePending(senderId, text, channel ?? "sendChain");
+          return;
+        }
         if (attempt < maxRetries) {
           logError(`WeChat send failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying: ${errorText}`);
           await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -458,6 +532,27 @@ function wireAdapterEvents(params: {
         if (event.message) {
           log(`${event.status}: ${event.message}`);
           stateStore.appendLog(`${event.status}: ${event.message}`);
+        }
+        if (
+          event.status === "awaiting_approval" &&
+          !stateStore.getState().pendingConfirmation
+        ) {
+          const pendingApproval = adapter.getState().pendingApproval;
+          if (pendingApproval) {
+            const pending: PendingApproval = {
+              ...pendingApproval,
+              code: buildOneTimeCode(),
+              createdAt: nowIso(),
+            };
+            stateStore.setPendingConfirmation(pending);
+            stateStore.appendLog(
+              `Approval requested (fallback): ${pending.commandPreview}`,
+            );
+            void flushAndSend(
+              formatApprovalMessage(pending, adapterState),
+              "approval",
+            );
+          }
         }
         break;
       case "notice":

@@ -880,8 +880,46 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         this.handleClaudePermissionRequest(params.requestId, payload, params.socket);
         return;
       case "Notification":
-        if (payload.notification_type === "permission_prompt" && this.pendingApproval) {
-          this.setStatus("awaiting_approval", "Claude approval is required.");
+        if (payload.notification_type === "permission_prompt") {
+          if (!this.pendingApproval) {
+            this.clearWechatWorkingNotice();
+            const toolName =
+              typeof payload.tool_name === "string"
+                ? payload.tool_name.trim()
+                : "";
+            const request: ApprovalRequest = {
+              source: "cli",
+              summary: toolName
+                ? `Claude permission is required for ${toolName}.`
+                : "Claude approval is required.",
+              commandPreview:
+                payload.message ?? payload.title ?? "Permission request",
+              toolName: toolName || undefined,
+              confirmInput:
+                this.pendingCliApprovalHints?.confirmInput ?? "y\r",
+              denyInput: this.pendingCliApprovalHints?.denyInput ?? "n\r",
+            };
+            this.pendingApproval = request;
+            this.pendingCliApprovalHints = null;
+            this.state.pendingApproval = this.pendingApproval;
+            this.state.pendingApprovalOrigin =
+              this.state.activeTurnOrigin;
+            this.setStatus(
+              "awaiting_approval",
+              "Claude approval is required.",
+            );
+            this.armStaleBusyWatchdog();
+            this.emit({
+              type: "approval_required",
+              request: this.pendingApproval,
+              timestamp: nowIso(),
+            });
+          } else {
+            this.setStatus(
+              "awaiting_approval",
+              "Claude approval is required.",
+            );
+          }
         }
         this.respondToClaudeHook(params.socket, params.requestId);
         return;
