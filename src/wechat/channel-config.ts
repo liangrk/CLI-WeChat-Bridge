@@ -30,6 +30,9 @@ export const CODEX_PANEL_ENDPOINT_FILE = path.join(
 );
 export const WORKSPACES_DIR = path.join(CHANNEL_DATA_DIR, "workspaces");
 
+/** Default TCP port for the Hub server in multi-project mode. */
+export const HUB_DEFAULT_PORT = 18760;
+
 export type WorkspaceChannelPaths = {
   workspaceDir: string;
   stateFile: string;

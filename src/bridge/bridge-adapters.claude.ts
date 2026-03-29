@@ -3,6 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { buildLocalCompanionToken } from "../companion/local-companion-link.ts";
 import { ensureWorkspaceChannelDir } from "../wechat/channel-config.ts";
+import { TraceLogger } from "./trace-logger.ts";
 import {
   buildClaudeFailureMessage,
   buildClaudeHookScript,
@@ -57,6 +58,7 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
   private runtimeSessionId: string | null;
   private resumeConversationId: string | null;
   private transcriptPath: string | null;
+  private traceLogger: TraceLogger | null = null;
   private pendingCliApprovalHints:
     | Pick<ApprovalRequest, "confirmInput" | "denyInput">
     | null = null;
@@ -276,6 +278,8 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
     this.clearPtyApprovalRetry();
     this.pendingCliApprovalHints = null;
     this.flushPendingClaudeHookApprovals();
+    this.traceLogger?.close();
+    this.traceLogger = null;
     await super.dispose();
     await this.stopHookServer();
   }
@@ -534,6 +538,10 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       "utf8",
     );
     this.settingsFilePath = settingsFilePath;
+
+    // Initialize trace logger in the same workspace directory
+    const traceDir = path.join(workspaceDir, "traces");
+    this.traceLogger = new TraceLogger(traceDir);
   }
 
   private attachLocalTerminal(): void {
@@ -923,6 +931,47 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         this.handleClaudeStopFailure(payload);
         this.respondToClaudeHook(params.socket, params.requestId);
         return;
+      case "PreToolUse":
+        this.emitTrace("PreToolUse", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "PostToolUse":
+        this.emitTrace("PostToolUse", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "PostToolUseFailure":
+        this.emitTrace("PostToolUseFailure", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "SubagentStart":
+        this.emitTrace("SubagentStart", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "SubagentStop":
+        this.emitTrace("SubagentStop", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "SessionEnd":
+        this.emitTrace("SessionEnd", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "TaskCreated":
+        this.emitTrace("TaskCreated", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "TaskCompleted":
+        this.emitTrace("TaskCompleted", payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
+      case "InstructionsLoaded":
+      case "ConfigChange":
+      case "CwdChanged":
+      case "FileChanged":
+      case "PreCompact":
+      case "PostCompact":
+        this.emitTrace(payload.hook_event_name!, payload);
+        this.respondToClaudeHook(params.socket, params.requestId);
+        return;
       default:
         this.respondToClaudeHook(params.socket, params.requestId);
         return;
@@ -1269,6 +1318,17 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
       }
       this.cancelPendingClaudeHookApproval(requestId);
     }
+  }
+
+  private emitTrace(event: string, payload: ClaudeHookPayload): void {
+    const record = payload as unknown as Record<string, unknown>;
+    this.traceLogger?.log(event, record);
+    this.emit({
+      type: "trace",
+      event,
+      payload: record,
+      timestamp: nowIso(),
+    });
   }
 }
 

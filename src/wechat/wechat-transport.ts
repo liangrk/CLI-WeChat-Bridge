@@ -73,6 +73,12 @@ interface GetUpdatesResp {
   get_updates_buf?: string;
 }
 
+interface SendMessageResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+}
+
 export type InboundWechatMessage = {
   senderId: string;
   sender: string;
@@ -169,52 +175,52 @@ async function apiFetch(params: {
   }
 }
 
-function extractReferenceLabel(item: MessageItem): string | null {
-  const ref = item.ref_msg;
-  if (!ref) {
-    return null;
-  }
-
-  const parts: string[] = [];
-  if (ref.title?.trim()) {
-    parts.push(ref.title.trim());
-  }
-  const quotedText = ref.message_item?.text_item?.text?.trim();
-  if (quotedText) {
-    parts.push(quotedText);
-  }
-
-  return parts.length ? `Quoted: ${parts.join(" | ")}` : null;
-}
-
 function extractTextFromMessage(message: WeixinMessage): string {
   if (!message.item_list?.length) {
     return "";
   }
 
-  const lines: string[] = [];
+  const textParts: string[] = [];
+  const quotedParts: string[] = [];
+
   for (const item of message.item_list) {
-    const reference = extractReferenceLabel(item);
-    if (reference && !lines.includes(reference)) {
-      lines.push(reference);
+    const ref = item.ref_msg;
+    if (ref) {
+      if (ref.title?.trim()) {
+        quotedParts.push(ref.title.trim());
+      }
+      const quotedText = ref.message_item?.text_item?.text?.trim();
+      if (quotedText) {
+        quotedParts.push(quotedText);
+      }
     }
 
     if (item.type === MSG_ITEM_TEXT) {
       const text = item.text_item?.text?.trim();
       if (text) {
-        lines.push(text);
+        textParts.push(text);
       }
     }
 
     if (item.type === MSG_ITEM_VOICE) {
       const transcript = item.voice_item?.text?.trim();
       if (transcript) {
-        lines.push(transcript);
+        textParts.push(transcript);
       }
     }
   }
 
-  return lines.join("\n").trim();
+  const userText = textParts.join(" ");
+  if (!userText) {
+    return "";
+  }
+
+  if (quotedParts.length > 0) {
+    const quotedSummary = quotedParts.join(" ").slice(0, 200);
+    return `[引用: ${quotedSummary}] ${userText}`;
+  }
+
+  return userText;
 }
 
 function buildMessageKey(message: WeixinMessage): string {
@@ -349,7 +355,7 @@ export class WeChatTransport {
       return;
     }
 
-    await apiFetch({
+    const raw = await apiFetch({
       baseUrl: account.baseUrl,
       endpoint: "ilink/bot/sendmessage",
       body: JSON.stringify({
@@ -367,6 +373,16 @@ export class WeChatTransport {
       token: account.token,
       timeoutMs: 15_000,
     });
+
+    const resp = JSON.parse(raw) as SendMessageResp;
+    if (
+      (resp.ret !== undefined && resp.ret !== 0) ||
+      (resp.errcode !== undefined && resp.errcode !== 0)
+    ) {
+      throw new Error(
+        `sendMessage failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
+      );
+    }
   }
 
   private async getUpdates(

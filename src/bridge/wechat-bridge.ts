@@ -6,6 +6,7 @@ import {
   createBridgeAdapter,
   resolveDefaultAdapterCommand,
 } from "./bridge-adapters.ts";
+import { HubServer } from "./hub-server.ts";
 import { migrateLegacyChannelFiles } from "../wechat/channel-config.ts";
 import { BridgeStateStore } from "./bridge-state.ts";
 import type {
@@ -45,6 +46,7 @@ type BridgeCliOptions = {
   command: string;
   cwd: string;
   profile?: string;
+  hub?: boolean;
 };
 
 type ActiveTask = {
@@ -65,6 +67,7 @@ function parseCliArgs(argv: string[]): BridgeCliOptions {
   let commandOverride: string | undefined;
   let cwd = process.cwd();
   let profile: string | undefined;
+  let hub = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -103,6 +106,9 @@ function parseCliArgs(argv: string[]): BridgeCliOptions {
       case "-h":
         printUsageAndExit();
         break;
+      case "--hub":
+        hub = true;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
     }
@@ -118,17 +124,19 @@ function parseCliArgs(argv: string[]): BridgeCliOptions {
     command: commandOverride ?? defaultCommand,
     cwd,
     profile,
+    hub,
   };
 }
 
 function printUsageAndExit(): never {
   process.stdout.write(
     [
-      "Usage: wechat-bridge --adapter <codex|claude|shell> [--cmd <executable>] [--cwd <path>] [--profile <name-or-path>]",
+      "Usage: wechat-bridge --adapter <codex|claude|shell> [--cmd <executable>] [--cwd <path>] [--profile <name-or-path>] [--hub]",
       "",
       "Examples:",
       "  wechat-bridge-codex",
       "  wechat-bridge-claude --cwd ~/work/my-project",
+      "  wechat-bridge-claude --hub        # Hub mode: multi-project routing",
       "  wechat-bridge-shell --cmd pwsh",
       "  wechat-bridge-shell --cmd bash",
       "  bun run bridge:codex            # repo-local development entrypoint",
@@ -142,6 +150,16 @@ async function main(): Promise<void> {
   migrateLegacyChannelFiles(log);
 
   const options = parseCliArgs(process.argv.slice(2));
+
+  if (options.hub) {
+    await mainHub(options);
+    return;
+  }
+
+  await mainSingleProject(options);
+}
+
+async function mainSingleProject(options: BridgeCliOptions): Promise<void> {
   const transport = new WeChatTransport({ log, logError });
 
   const credentials = transport.getCredentials();
@@ -435,6 +453,236 @@ async function main(): Promise<void> {
           stateStore.getState().authorizedUserId,
           `${options.adapter} is still running. Waiting for more output...`,
         );
+      }
+    }
+  } finally {
+    await cleanup();
+  }
+}
+
+// --- Hub mode ---
+
+async function mainHub(options: BridgeCliOptions): Promise<void> {
+  const transport = new WeChatTransport({ log, logError });
+
+  const credentials = transport.getCredentials();
+  if (!credentials) {
+    throw new Error('No saved WeChat credentials found. Run "bun run setup" first.');
+  }
+  if (!credentials.userId) {
+    throw new Error('Saved WeChat credentials are missing userId. Run "bun run setup" again.');
+  }
+
+  const authorizedUserId = credentials.userId;
+  const hub = new HubServer({ log, logError });
+
+  let sendChain = Promise.resolve();
+  let replySendChain = Promise.resolve();
+
+  const sendWithRetry = async (senderId: string, text: string, channel?: string) => {
+    const maxRetries = 3;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        await transport.sendText(senderId, text);
+        if (channel) log(`${channel} message sent: ${truncatePreview(text, 80)}`);
+        return;
+      } catch (err) {
+        const errorText = err instanceof Error ? err.message : String(err);
+        if (attempt < maxRetries) {
+          logError(`WeChat send failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying: ${errorText}`);
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+        } else {
+          logError(`Failed to send WeChat reply after ${maxRetries + 1} attempts: ${errorText}`);
+        }
+      }
+    }
+  };
+
+  const queueWechatMessage = (senderId: string, text: string) => {
+    sendChain = sendChain.then(() => sendWithRetry(senderId, text, "hub"));
+    return sendChain;
+  };
+
+  const queueReplyMessage = (senderId: string, text: string) => {
+    replySendChain = replySendChain.then(() => sendWithRetry(senderId, text, "hub-reply"));
+    return replySendChain;
+  };
+
+  const label = (projectName: string, text: string): string => {
+    return `[${projectName}] ${text}`;
+  };
+
+  // Wire Hub events → WeChat
+  hub.setEventSink((event) => {
+    switch (event.type) {
+      case "spoke_online":
+        log(`Spoke online: ${event.projectName}`);
+        void queueWechatMessage(authorizedUserId, `[${event.projectName}] 项目已上线`);
+        break;
+      case "spoke_offline":
+        log(`Spoke offline: ${event.projectName} (${event.reason})`);
+        void queueWechatMessage(
+          authorizedUserId,
+          `[${event.projectName}] 项目已离线${event.reason === "heartbeat_timeout" ? "（超时）" : ""}`,
+        );
+        break;
+      case "spoke_event": {
+        const { projectName, event: spokeEvent } = event;
+        switch (spokeEvent.type) {
+          case "final_reply":
+            void queueReplyMessage(
+              authorizedUserId,
+              label(projectName, formatFinalReplyMessage(options.adapter, spokeEvent.text)),
+            );
+            break;
+          case "approval_required": {
+            const req = spokeEvent.request;
+            const lines = ["等待审批："];
+            if (req.toolName) lines.push(`工具: ${req.toolName}`);
+            lines.push(req.commandPreview);
+            if (req.detailPreview) lines.push(`${req.detailLabel ?? "详情"}: ${req.detailPreview}`);
+            void queueWechatMessage(authorizedUserId, label(projectName, lines.join("\n")));
+            break;
+          }
+            break;
+          case "status":
+            if (spokeEvent.status === "busy" || spokeEvent.status === "idle") {
+              log(`[${projectName}] ${spokeEvent.status}`);
+            }
+            break;
+          case "notice":
+            void queueWechatMessage(authorizedUserId, label(projectName, spokeEvent.text));
+            break;
+          case "mirrored_user_input":
+            void queueWechatMessage(
+              authorizedUserId,
+              label(projectName, formatMirroredUserInputMessage(options.adapter, spokeEvent.text)),
+            );
+            break;
+          case "task_complete":
+            log(`[${projectName}] task_complete`);
+            break;
+          case "task_failed":
+            void queueWechatMessage(
+              authorizedUserId,
+              label(projectName, formatTaskFailedMessage(options.adapter, spokeEvent.message)),
+            );
+            break;
+          case "fatal_error":
+            void queueWechatMessage(
+              authorizedUserId,
+              label(projectName, `错误: ${spokeEvent.message}`),
+            );
+            break;
+        }
+        break;
+      }
+    }
+  });
+
+  const cleanup = async () => {
+    await hub.stop();
+  };
+
+  process.on("SIGINT", () => {
+    void cleanup().finally(() => process.exit(0));
+  });
+  process.on("SIGTERM", () => {
+    void cleanup().finally(() => process.exit(0));
+  });
+
+  try {
+    const port = await hub.start();
+    log(`Hub mode active on port ${port}.`);
+    log(`Authorized WeChat user: ${credentials.userId}`);
+    log('Start companion(s) in project directories with: wechat-claude');
+
+    let consecutivePollFailures = 0;
+
+    while (true) {
+      let pollResult;
+      try {
+        pollResult = await transport.pollMessages({
+          timeoutMs: DEFAULT_LONG_POLL_TIMEOUT_MS,
+          minCreatedAtMs: Date.now() - MESSAGE_START_GRACE_MS,
+        });
+        consecutivePollFailures = 0;
+      } catch (err) {
+        if (err instanceof WeChatSessionExpiredError) {
+          logError(err.message);
+          break;
+        }
+
+        consecutivePollFailures++;
+        const errorText = err instanceof Error ? err.message : String(err);
+        logError(`Poll error (attempt ${consecutivePollFailures}): ${errorText}`);
+
+        if (consecutivePollFailures === POLL_MAX_CONSECUTIVE_FAILURES) {
+          void queueWechatMessage(
+            authorizedUserId,
+            `Hub is experiencing persistent connection errors (${consecutivePollFailures} failures). Will keep retrying.`,
+          );
+        }
+
+        const jitter = Math.floor(Math.random() * POLL_RETRY_JITTER_MS);
+        await new Promise((resolve) => setTimeout(resolve, POLL_RETRY_DELAY_MS + jitter));
+        continue;
+      }
+
+      for (const message of pollResult.messages) {
+        if (message.senderId !== authorizedUserId) {
+          await queueWechatMessage(
+            message.senderId,
+            "Unauthorized. This bridge only accepts messages from the configured WeChat owner.",
+          );
+          continue;
+        }
+
+        const text = message.text.trim();
+        const systemCommand = parseWechatControlCommand(text, {
+          adapter: options.adapter,
+          hasPendingConfirmation: false,
+        });
+
+        try {
+          // Handle Hub-level commands
+          if (systemCommand?.type === "status") {
+            const report = await hub.routeCommand("status");
+            if (report) await queueWechatMessage(authorizedUserId, report);
+            continue;
+          }
+          if (text.startsWith("/projects")) {
+            const list = await hub.routeCommand("projects");
+            if (list) await queueWechatMessage(authorizedUserId, list);
+            continue;
+          }
+          if (systemCommand?.type === "stop") {
+            const args = text.replace(/^\/stop\s*/, "").trim() || undefined;
+            const reply = await hub.routeCommand("stop", args);
+            if (reply) await queueWechatMessage(authorizedUserId, reply);
+            continue;
+          }
+          if (systemCommand?.type === "reset") {
+            const args = text.replace(/^\/reset\s*/, "").trim() || undefined;
+            const reply = await hub.routeCommand("reset", args);
+            if (reply) await queueWechatMessage(authorizedUserId, reply);
+            continue;
+          }
+          if (systemCommand?.type === "confirm" || systemCommand?.type === "deny") {
+            const action = systemCommand.type === "confirm" ? "confirm" : "deny";
+            const reply = await hub.routeApproval(action);
+            if (reply) await queueWechatMessage(authorizedUserId, reply);
+            continue;
+          }
+
+          // Route as normal message
+          const reply = await hub.routeMessage(text);
+          if (reply) await queueWechatMessage(authorizedUserId, reply);
+        } catch (err) {
+          const errorText = err instanceof Error ? err.message : String(err);
+          logError(errorText);
+          await queueWechatMessage(authorizedUserId, `Hub error: ${errorText}`);
+        }
       }
     }
   } finally {

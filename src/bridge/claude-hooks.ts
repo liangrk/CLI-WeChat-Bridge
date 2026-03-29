@@ -1,11 +1,25 @@
-import type { ApprovalRequest } from "./bridge-types.ts";
+import type { ApprovalRequest, AskUserQuestionOption } from "./bridge-types.ts";
 import { normalizeOutput, truncatePreview } from "./bridge-utils.ts";
 
 export type ClaudeHookEventName =
   | "SessionStart"
+  | "SessionEnd"
   | "UserPromptSubmit"
+  | "PreToolUse"
+  | "PostToolUse"
+  | "PostToolUseFailure"
   | "PermissionRequest"
+  | "SubagentStart"
+  | "SubagentStop"
+  | "TaskCreated"
+  | "TaskCompleted"
   | "Notification"
+  | "InstructionsLoaded"
+  | "ConfigChange"
+  | "CwdChanged"
+  | "FileChanged"
+  | "PreCompact"
+  | "PostCompact"
   | "Stop"
   | "StopFailure";
 
@@ -19,6 +33,7 @@ export type ClaudeHookPayload = {
   permission_mode?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
+  tool_output?: string;
   permission_suggestions?: unknown[];
   notification_type?: string;
   message?: string;
@@ -26,7 +41,13 @@ export type ClaudeHookPayload = {
   last_assistant_message?: string;
   error?: string;
   error_details?: string;
+  exit_code?: number;
   stop_hook_active?: boolean;
+  agent_type?: string;
+  agent_id?: string;
+  task_name?: string;
+  file_path?: string;
+  config_source?: string;
 };
 
 export type PendingInjectedClaudePrompt = {
@@ -88,6 +109,29 @@ export function extractClaudeResumeConversationId(
   return conversationId || null;
 }
 
+const ALL_HOOK_EVENTS: ClaudeHookEventName[] = [
+  "SessionStart",
+  "SessionEnd",
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "PermissionRequest",
+  "SubagentStart",
+  "SubagentStop",
+  "TaskCreated",
+  "TaskCompleted",
+  "Notification",
+  "InstructionsLoaded",
+  "ConfigChange",
+  "CwdChanged",
+  "FileChanged",
+  "PreCompact",
+  "PostCompact",
+  "Stop",
+  "StopFailure",
+];
+
 export function buildClaudeHookSettings(
   command: string,
 ): Record<string, unknown> {
@@ -100,19 +144,19 @@ export function buildClaudeHookSettings(
     ],
   };
 
-  const hooks: Record<string, unknown> = {
-    SessionStart: [hook],
-    UserPromptSubmit: [hook],
-    PermissionRequest: [hook],
-    Notification: [
-      {
-        matcher: "permission_prompt",
-        hooks: hook.hooks,
-      },
-    ],
-    Stop: [hook],
-    StopFailure: [hook],
-  };
+  const hooks: Record<string, unknown> = {};
+  for (const event of ALL_HOOK_EVENTS) {
+    if (event === "Notification") {
+      hooks[event] = [
+        {
+          matcher: "permission_prompt",
+          hooks: hook.hooks,
+        },
+      ];
+    } else {
+      hooks[event] = [hook];
+    }
+  }
 
   return { hooks };
 }

@@ -21,7 +21,7 @@ export type LocalCompanionCommand =
   | { command: "interrupt" }
   | { command: "reset" }
   | { command: "dispose" }
-  | { command: "resolve_approval"; action: "confirm" | "deny" };
+  | { command: "resolve_approval"; action: "confirm" | "deny"; text?: string };
 
 export type LocalCompanionEndpoint = {
   instanceId: string;
@@ -67,6 +67,35 @@ export type LocalCompanionMessage =
   | {
       type: "state";
       state: BridgeAdapterState;
+    }
+  // Hub-Spoke protocol extensions
+  | {
+      type: "register";
+      projectName: string;
+      cwd: string;
+      token: string;
+    }
+  | {
+      type: "register_ack";
+      accepted: boolean;
+      reason?: string;
+    }
+  | {
+      type: "wechat_message";
+      messageId: string;
+      text: string;
+      fromUserId: string;
+    }
+  | {
+      type: "wechat_command";
+      command: string;
+      args?: string;
+    }
+  | {
+      type: "ping";
+    }
+  | {
+      type: "pong";
     };
 
 function normalizeEndpoint(value: unknown): LocalCompanionEndpoint | null {

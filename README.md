@@ -7,7 +7,7 @@
 
 > 当前支持状态说明  
 > - `codex`：目前功能链路较为完整，仍在持续补齐审批与会话一致性体验
-> - `claude code`：已接入双终端 companion 桥接；当前以 hooks + interactive PTY 为主线，仍在持续补齐审批与会话一致性体验
+> - `claude code`：已接入双终端 companion 桥接；采用纯 Hook 方案监听 Claude Code 全生命周期（20 个 Hook 事件），支持引用消息内联上下文、JSONL Trace 日志记录
 > - `shell`：可用，适合持久化 PowerShell 会话桥接
 
 ## 这个项目解决什么问题
@@ -179,7 +179,7 @@ wechat-claude-go --dangerously-skip-permissions
 | 适配器 | 当前状态 | 说明 |
 | --- | --- | --- |
 | `codex` | 当前优先支持，完成度最高 | 双终端模式；本地 panel 为线程权威；微信跟随本地线程；本地与远程衔接能力最完整 |
-| `claude` | 已接入，持续完善中 | 当前采用 `wechat-bridge-claude` + `wechat-claude` 的双终端 companion 模式；会话切换、最终回复与审批元数据已按 Claude session 语义同步，但整体成熟度仍低于 `codex` |
+| `claude` | 已接入，持续完善中 | 双终端 companion 模式；纯 Hook 方案监听 Claude Code 20 个生命周期事件；支持引用消息内联上下文、远程审批确认、JSONL Trace 日志；整体成熟度仍低于 `codex` |
 | `shell` | 可用 | 持久 `powershell.exe` 会话；高风险命令支持审批 |
 
 
@@ -273,6 +273,7 @@ wechat-bridge-shell --cmd pwsh.exe
 | `bridge.lock.json` | bridge 运行锁 |
 | `workspaces/<workspace-key>/bridge-state.json` | 当前工作区状态 |
 | `workspaces/<workspace-key>/codex-panel-endpoint.json` | 当前工作区 panel endpoint |
+| `workspaces/<workspace-key>/traces/<date>.trace.jsonl` | Claude Code Hook 事件 Trace 日志（按日轮转） |
 
 ### 环境变量
 
@@ -356,7 +357,7 @@ npm install -g .
 
 - 当前主要在 Windows/Linux 环境下验证
 - `codex` 是当前优先支持的路径
-- `claude code` 当前已切到 companion + hooks 路径
+- `claude code` 当前已切到 companion + 纯 Hook 方案（不再通过 PTY stdout 转发到微信）
 - `codex` 模式下微信 `/resume` 被禁用
 - 当前模型是单 owner、单 bridge、单活动工作区
 - `claude code` 远程审批链路现已可用；微信侧可直接确认或拒绝 Claude 的权限请求
@@ -373,7 +374,9 @@ npm install -g .
 | `src/companion/local-companion.ts` | `wechat-codex` / `wechat-claude` 本地 companion 入口 |
 | `src/companion/codex-panel.ts` | Codex panel 入口（备用） |
 | `src/companion/codex-panel-link.ts` | bridge 与 Codex panel 的本地 IPC |
-| `src/wechat/wechat-transport.ts` | iLink 消息收发 |
+| `src/wechat/wechat-transport.ts` | iLink 消息收发、引用消息解析 |
+| `src/bridge/claude-hooks.ts` | Claude Code Hook 事件类型定义与配置生成（20 个事件） |
+| `src/bridge/trace-logger.ts` | JSONL Trace 日志记录器（按日轮转） |
 | `src/bridge/bridge-state.ts` | bridge 状态、锁与日志 |
 | `src/wechat/setup.ts` | 登录与凭据初始化 |
 

@@ -167,6 +167,12 @@ export type BridgeEvent =
       type: "fatal_error";
       message: string;
       timestamp: string;
+    }
+  | {
+      type: "trace";
+      event: string;
+      payload: Record<string, unknown>;
+      timestamp: string;
     };
 
 export interface BridgeAdapter {
@@ -181,3 +187,17 @@ export interface BridgeAdapter {
   dispose(): Promise<void>;
   getState(): BridgeAdapterState;
 }
+
+// --- Hub-Spoke types ---
+
+export type HubSpokeStatus = "online" | "stale" | "offline";
+
+export type HubSpokeInfo = {
+  projectName: string;
+  cwd: string;
+  status: HubSpokeStatus;
+  connectedAt: string;
+  lastPingAt: number;
+  adapterState?: BridgeAdapterState;
+  pendingApproval?: ApprovalRequest;
+};
