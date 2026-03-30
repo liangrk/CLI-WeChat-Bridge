@@ -558,14 +558,25 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
             break;
           case "approval_required": {
             const req = spokeEvent.request;
-            const lines = ["等待审批："];
+            const isAskUserQuestion =
+              req.toolName === "AskUserQuestion" &&
+              req.askUserQuestions &&
+              req.askUserQuestions.length > 0;
+            const lines: string[] = ["等待审批："];
             if (req.toolName) lines.push(`工具: ${req.toolName}`);
-            lines.push(req.commandPreview);
-            if (req.detailPreview) lines.push(`${req.detailLabel ?? "详情"}: ${req.detailPreview}`);
+            if (req.detailPreview) {
+              lines.push(`${req.detailLabel ?? "详情"}: ${req.detailPreview}`);
+            } else if (req.commandPreview) {
+              lines.push(`详情: ${req.commandPreview}`);
+            }
+            if (isAskUserQuestion) {
+              lines.push("请输入数字选择选项（如 1），或直接输入文字回答。");
+            } else {
+              lines.push("回复 /confirm 确认，/deny 拒绝。");
+            }
             void queueWechatMessage(authorizedUserId, label(projectName, lines.join("\n")));
             break;
           }
-            break;
           case "status":
             if (spokeEvent.status === "busy" || spokeEvent.status === "idle") {
               log(`[${projectName}] ${spokeEvent.status}`);
@@ -666,9 +677,10 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
         }
 
         const text = message.text.trim();
+        const hasPending = hub.hasAnyPendingApproval();
         const systemCommand = parseWechatControlCommand(text, {
           adapter: options.adapter,
-          hasPendingConfirmation: false,
+          hasPendingConfirmation: hasPending,
         });
 
         try {
@@ -695,8 +707,52 @@ async function mainHub(options: BridgeCliOptions): Promise<void> {
             if (reply) await queueWechatMessage(authorizedUserId, reply);
             continue;
           }
+
+          // AskUserQuestion: handle option selection before confirm/deny
+          const pendingInfo = hub.findSpokeWithPendingApproval();
+          if (
+            pendingInfo?.approval.toolName === "AskUserQuestion" &&
+            pendingInfo.approval.askUserQuestions &&
+            pendingInfo.approval.askUserQuestions.length > 0
+          ) {
+            if (systemCommand?.type === "deny") {
+              const reply = await hub.routeApproval("deny");
+              if (reply) await queueWechatMessage(authorizedUserId, reply);
+              continue;
+            } else if (systemCommand?.type === "confirm") {
+              await queueWechatMessage(
+                authorizedUserId,
+                "请输入数字选择选项（如 1），或直接输入文字回答。回复 /deny 拒绝。",
+              );
+              continue;
+            } else {
+              const numericMatch = text.match(/^[\d,.\s]+$/);
+              let responseText: string;
+
+              if (numericMatch) {
+                const indices = text
+                  .split(/[,.\s]+/)
+                  .map(Number)
+                  .filter(
+                    (n) =>
+                      n >= 1 &&
+                      n <= pendingInfo.approval.askUserQuestions!.length,
+                  );
+                responseText =
+                  indices.length > 0 ? indices.join(", ") : text;
+              } else {
+                responseText = text;
+              }
+
+              const reply = await hub.routeApproval("confirm", responseText);
+              if (reply) await queueWechatMessage(authorizedUserId, reply);
+              continue;
+            }
+          }
+
           if (systemCommand?.type === "confirm" || systemCommand?.type === "deny") {
-            const action = systemCommand.type === "confirm" ? "confirm" : "deny";
+            const action =
+              systemCommand.type === "confirm" ? "confirm" : "deny";
             const reply = await hub.routeApproval(action);
             if (reply) await queueWechatMessage(authorizedUserId, reply);
             continue;

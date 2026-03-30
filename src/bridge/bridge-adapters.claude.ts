@@ -896,6 +896,9 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         this.handleClaudePermissionRequest(params.requestId, payload, params.socket);
         return;
       case "Notification":
+        if (payload.notification_type !== "permission_prompt") {
+          process.stderr.write(`[claude-adapter] unhandled notification: type=${payload.notification_type}\n`);
+        }
         if (payload.notification_type === "permission_prompt") {
           if (!this.pendingApproval) {
             this.clearWechatWorkingNotice();
@@ -968,6 +971,15 @@ export class ClaudeCompanionAdapter extends AbstractPtyAdapter {
         this.respondToClaudeHook(params.socket, params.requestId);
         return;
       case "SessionEnd":
+        process.stderr.write("[claude-adapter] SessionEnd: cleaning up stale state\n");
+        if (this.pendingApproval) {
+          this.pendingApproval = null;
+          this.state.pendingApproval = null;
+          this.state.pendingApprovalOrigin = undefined;
+          this.setStatus("idle");
+        }
+        this.flushPendingClaudeHookApprovals(false);
+        this.clearWechatWorkingNotice();
         this.emitTrace("SessionEnd", payload);
         this.respondToClaudeHook(params.socket, params.requestId);
         return;

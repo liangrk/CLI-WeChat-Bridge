@@ -259,6 +259,20 @@ export class HubServer {
     return "当前没有待审批请求。";
   }
 
+  hasAnyPendingApproval(): boolean {
+    for (const [, spoke] of this.spokes) {
+      if (spoke.pendingApproval) return true;
+    }
+    return false;
+  }
+
+  findSpokeWithPendingApproval(): { name: string; approval: ApprovalRequest } | null {
+    for (const [name, spoke] of this.spokes) {
+      if (spoke.pendingApproval) return { name, approval: spoke.pendingApproval };
+    }
+    return null;
+  }
+
   // --- Send command to spoke ---
 
   async sendToSpoke(
@@ -466,6 +480,7 @@ export class HubServer {
 
   private handleSpokeDisconnect(spoke: SpokeConnection): void {
     this.destroySpoke(spoke);
+    spoke.pendingApproval = undefined;
     if (spoke.projectName && this.spokes.get(spoke.projectName) === spoke) {
       this.spokes.delete(spoke.projectName);
       this.log(`Spoke disconnected: ${spoke.projectName}`);
